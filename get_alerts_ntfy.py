@@ -14,8 +14,8 @@ import requests
 NWS_API_URL = "https://api.weather.gov/alerts/active"
 
 # Default location: central Reno.
-DEFAULT_LATITUDE = 45.80694 #39.5296
-DEFAULT_LONGITUDE = -108.5422 #-119.8138
+DEFAULT_LATITUDE = 39.5296
+DEFAULT_LONGITUDE = -119.8138
 
 NWS_HEADERS = {
     "User-Agent": "local-weather-alert-checker/1.0 (admin@example.org)",
