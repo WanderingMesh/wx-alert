@@ -17,7 +17,10 @@ COPY --chown=wxalert:wxalert get_alerts_ntfy.py config.ini /app/
 
 USER wxalert
 
-# Default: perform one NWS check, publish active alerts to ntfy, then exit.
-# Test mode: docker run --rm IMAGE --ntfy-test
+STOPSIGNAL SIGTERM
+
+# Default: run continuously, query NWS at CHECK_INTERVAL, and publish new
+# active alerts to ntfy. Test mode exits after one test notification:
+#   docker run --rm IMAGE --ntfy-test
 ENTRYPOINT ["python", "/app/get_alerts_ntfy.py", "--config", "/app/config.ini"]
-CMD ["--ntfy"]
+CMD ["--ntfy", "--loop"]

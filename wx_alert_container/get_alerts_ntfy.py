@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import configparser
 import logging
+import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,7 @@ DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 DEFAULT_NTFY_TAGS = "warning,weather"
 DEFAULT_NTFY_PRIORITY = "auto"
 DEFAULT_DELAY_SECONDS = 1
+DEFAULT_CHECK_INTERVAL_SECONDS = 3600
 
 # Replace this contact address with a real monitored address before broad use.
 NWS_HEADERS = {
@@ -38,6 +41,7 @@ NTFY_PRIORITY_CHOICES = (
 )
 
 LOGGER = logging.getLogger("wx-alert")
+STOP_EVENT = threading.Event()
 
 
 class ConfigurationError(ValueError):
@@ -54,6 +58,7 @@ class FileConfiguration:
     ntfy_tags: str
     ntfy_priority: str
     delay: int
+    check_interval: int
 
 
 def configure_logging() -> None:
@@ -87,6 +92,26 @@ def delay_seconds(value: str) -> int:
     try:
         delay = int(value)
         return validate_delay(delay, "delay")
+    except (ValueError, ConfigurationError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def validate_check_interval(
+    value: int,
+    source: str = "check interval",
+) -> int:
+    if not 5 <= value <= 3600:
+        raise ConfigurationError(
+            f"{source} must be between 5 and 3600 seconds"
+        )
+    return value
+
+
+def check_interval_seconds(value: str) -> int:
+    """argparse validator for the interval between NWS checks."""
+    try:
+        interval = int(value)
+        return validate_check_interval(interval, "check interval")
     except (ValueError, ConfigurationError) as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -215,6 +240,22 @@ def load_configuration(path: Path) -> FileConfiguration:
 
     delay = validate_delay(delay, "[delivery] DELAY_SECONDS")
 
+    try:
+        check_interval = parser.getint(
+            "delivery",
+            "CHECK_INTERVAL",
+            fallback=DEFAULT_CHECK_INTERVAL_SECONDS,
+        )
+    except ValueError as exc:
+        raise ConfigurationError(
+            "[delivery] CHECK_INTERVAL must be an integer"
+        ) from exc
+
+    check_interval = validate_check_interval(
+        check_interval,
+        "[delivery] CHECK_INTERVAL",
+    )
+
     return FileConfiguration(
         latitude=latitude,
         longitude=longitude,
@@ -224,6 +265,7 @@ def load_configuration(path: Path) -> FileConfiguration:
         ntfy_tags=tags,
         ntfy_priority=priority,
         delay=delay,
+        check_interval=check_interval,
     )
 
 
@@ -269,6 +311,29 @@ def parse_arguments() -> argparse.Namespace:
             "Delay between multiple alert messages, from 1 to 60 seconds. "
             f"Configured default: {config.delay}."
         ),
+    )
+
+    parser.add_argument(
+        "--check-interval",
+        type=check_interval_seconds,
+        default=config.check_interval,
+        metavar="SECONDS",
+        help=(
+            "Interval between NWS checks in polling mode, from 5 to 3600 "
+            f"seconds. Configured default: {config.check_interval}."
+        ),
+    )
+
+    run_mode = parser.add_mutually_exclusive_group()
+    run_mode.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run continuously, checking at the configured interval.",
+    )
+    run_mode.add_argument(
+        "--once",
+        action="store_true",
+        help="Perform one NWS check and exit.",
     )
 
     parser.add_argument(
@@ -551,16 +616,36 @@ def publish_test_notification(
         LOGGER.info("ntfy test successful")
 
 
+def alert_identity(alert: dict[str, Any]) -> str:
+    """Return a stable identifier used to suppress duplicate notifications."""
+    alert_id = clean_optional(
+        str(alert.get("id") or alert.get("@id") or "")
+    )
+    if alert_id:
+        return alert_id
+
+    # Defensive fallback for malformed or incomplete alert records.
+    return "|".join(
+        (
+            clean_field(alert.get("event"), "Unknown"),
+            clean_field(alert.get("headline"), "No headline"),
+            clean_field(alert.get("sent"), "Unknown"),
+        )
+    )
+
+
 def process_alerts(
     session: requests.Session,
     alerts: list[dict[str, Any]],
     args: argparse.Namespace,
-) -> int:
-    """Print and optionally publish every alert as a separate record."""
+) -> tuple[int, set[str]]:
+    """Print and optionally publish every new alert as a separate record."""
     failures = 0
+    completed_ids: set[str] = set()
     total_alerts = len(alerts)
 
     for index, alert in enumerate(alerts, start=1):
+        identity = alert_identity(alert)
         event = clean_field(alert.get("event"), "Unknown weather alert")
         headline = clean_field(alert.get("headline"), "No headline provided.")
 
@@ -573,10 +658,11 @@ def process_alerts(
 
         print(stdout_message, flush=True)
 
+        delivered = True
         if args.ntfy:
             priority = ntfy_priority_for_alert(alert, args.ntfy_priority)
             LOGGER.info(
-                "Publishing alert %d/%d event=%r priority=%s",
+                "Publishing new alert %d/%d event=%r priority=%s",
                 index,
                 total_alerts,
                 event,
@@ -610,6 +696,7 @@ def process_alerts(
                     )
 
             except requests.RequestException as exc:
+                delivered = False
                 failures += 1
                 LOGGER.error(
                     "ntfy delivery failed alert=%d/%d event=%r error=%s",
@@ -619,24 +706,127 @@ def process_alerts(
                     exc,
                 )
 
+        if delivered:
+            completed_ids.add(identity)
+
         if index < total_alerts:
             print(flush=True)
             LOGGER.info(
-                "Waiting %d second(s) before the next alert",
+                "Waiting %d second(s) before the next notification",
                 args.delay,
             )
-            time.sleep(args.delay)
+            if STOP_EVENT.wait(args.delay):
+                LOGGER.info("Stop requested during notification delay")
+                break
 
-    return failures
+    return failures, completed_ids
+
+
+def perform_alert_check(
+    session: requests.Session,
+    args: argparse.Namespace,
+    notified_alert_ids: set[str],
+) -> tuple[int, set[str]]:
+    """Perform one NWS query and deliver only alerts not already notified."""
+    LOGGER.info(
+        "Querying NWS active alerts latitude=%.5f longitude=%.5f",
+        args.latitude,
+        args.longitude,
+    )
+
+    try:
+        alerts = get_active_alerts(
+            session,
+            args.latitude,
+            args.longitude,
+        )
+    except requests.Timeout:
+        LOGGER.error("NWS API request timed out")
+        return 1, set()
+    except requests.HTTPError as exc:
+        status_code = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+        response_text = (
+            exc.response.text[:500]
+            if exc.response is not None
+            else ""
+        )
+        LOGGER.error(
+            "NWS API failed HTTP status=%s response=%r error=%s",
+            status_code,
+            response_text,
+            exc,
+        )
+        return 1, set()
+    except requests.RequestException as exc:
+        LOGGER.error("NWS API request failed error=%s", exc)
+        return 1, set()
+    except ValueError as exc:
+        LOGGER.error("NWS returned invalid JSON error=%s", exc)
+        return 1, set()
+
+    new_alerts = [
+        alert
+        for alert in alerts
+        if alert_identity(alert) not in notified_alert_ids
+    ]
+
+    LOGGER.info(
+        "NWS returned %d active alert(s); %d new alert(s)",
+        len(alerts),
+        len(new_alerts),
+    )
+
+    if not new_alerts:
+        LOGGER.info("No new NWS alerts; no notification sent")
+        return 0, set()
+
+    delivery_failures, completed_ids = process_alerts(
+        session,
+        new_alerts,
+        args,
+    )
+
+    if delivery_failures:
+        LOGGER.error(
+            "Check completed with %d ntfy delivery failure(s); "
+            "failed alerts will be retried on the next check",
+            delivery_failures,
+        )
+        return 2, completed_ids
+
+    LOGGER.info("Check completed successfully")
+    return 0, completed_ids
+
+
+def request_stop(signum: int, _frame: Any) -> None:
+    """Handle Docker stop, SIGTERM, and Ctrl-C cleanly."""
+    try:
+        signal_name = signal.Signals(signum).name
+    except ValueError:
+        signal_name = str(signum)
+
+    LOGGER.info("Received %s; stopping after current operation", signal_name)
+    STOP_EVENT.set()
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
 
 
 def main() -> int:
     configure_logging()
     args = parse_arguments()
+    install_signal_handlers()
 
+    mode = "ntfy-test" if args.ntfy_test else ("polling" if args.loop else "once")
     LOGGER.info(
         "Starting wx-alert mode=%s config=%s",
-        "ntfy-test" if args.ntfy_test else "check",
+        mode,
         args.config,
     )
 
@@ -671,62 +861,50 @@ def main() -> int:
 
             return 0
 
-        LOGGER.info(
-            "Querying NWS active alerts latitude=%.5f longitude=%.5f",
-            args.latitude,
-            args.longitude,
-        )
+        notified_alert_ids: set[str] = set()
 
-        try:
-            alerts = get_active_alerts(
+        if not args.loop:
+            status, _completed_ids = perform_alert_check(
                 session,
-                args.latitude,
-                args.longitude,
+                args,
+                notified_alert_ids,
             )
-        except requests.Timeout:
-            LOGGER.error("NWS API request timed out")
-            return 1
-        except requests.HTTPError as exc:
-            status_code = (
-                exc.response.status_code
-                if exc.response is not None
-                else "unknown"
+            return status
+
+        LOGGER.info(
+            "Polling enabled check_interval=%d seconds",
+            args.check_interval,
+        )
+        check_number = 0
+
+        while not STOP_EVENT.is_set():
+            check_number += 1
+            LOGGER.info("Beginning check cycle=%d", check_number)
+
+            status, completed_ids = perform_alert_check(
+                session,
+                args,
+                notified_alert_ids,
             )
-            response_text = (
-                exc.response.text[:500]
-                if exc.response is not None
-                else ""
+            notified_alert_ids.update(completed_ids)
+
+            if status != 0:
+                LOGGER.warning(
+                    "Check cycle=%d finished with status=%d; polling will continue",
+                    check_number,
+                    status,
+                )
+
+            if STOP_EVENT.is_set():
+                break
+
+            LOGGER.info(
+                "Next NWS check in %d second(s)",
+                args.check_interval,
             )
-            LOGGER.error(
-                "NWS API failed HTTP status=%s response=%r error=%s",
-                status_code,
-                response_text,
-                exc,
-            )
-            return 1
-        except requests.RequestException as exc:
-            LOGGER.error("NWS API request failed error=%s", exc)
-            return 1
-        except ValueError as exc:
-            LOGGER.error("NWS returned invalid JSON error=%s", exc)
-            return 1
+            STOP_EVENT.wait(args.check_interval)
 
-        LOGGER.info("NWS returned %d active alert(s)", len(alerts))
-
-        if not alerts:
-            LOGGER.info("No active NWS alerts; no notification sent")
-            return 0
-
-        delivery_failures = process_alerts(session, alerts, args)
-
-        if delivery_failures:
-            LOGGER.error(
-                "Completed with %d ntfy delivery failure(s)",
-                delivery_failures,
-            )
-            return 2
-
-        LOGGER.info("Completed successfully")
+        LOGGER.info("wx-alert stopped cleanly")
         return 0
 
 

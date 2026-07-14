@@ -2,14 +2,27 @@
 
 ## 1. Configure
 
-Edit `config.ini`. At minimum, set:
+Edit `config.ini`. At minimum, set the latitude, longitude, and ntfy topic:
 
 ```ini
+[weather]
+DEFAULT_LATITUDE = 45.80694
+DEFAULT_LONGITUDE = -108.5422
+
 [ntfy]
 TOPIC = your-long-unguessable-topic
+
+[delivery]
+# Delay between separate notifications when multiple alerts are found.
+DELAY_SECONDS = 1
+
+# Check interval - how often the script runs to check for new updates.
+# Range: 5-3600 seconds. Default: 3600.
+CHECK_INTERVAL = 3600
 ```
 
-Also set the latitude and longitude under `[weather]`.
+`CHECK_INTERVAL` controls the long-running container's polling interval. It is
+not the delay between multiple notifications; that remains `DELAY_SECONDS`.
 
 ## 2. Build
 
@@ -25,40 +38,58 @@ This sends one test notification, does not query NWS, and exits:
 docker run --rm --name wx-alert-test wx-alert:latest --ntfy-test
 ```
 
-## 4. Perform one alert check
+## 4. Run continuously
 
-The image defaults to `--ntfy`, so this queries NWS once, sends each active
-alert as a separate ntfy notification, and exits:
+The image defaults to `--ntfy --loop`. It performs its first NWS check
+immediately, then repeats at `CHECK_INTERVAL`:
 
 ```bash
-docker run --name wx-alert wx-alert:latest
+docker run -d \
+  --name wx-alert \
+  --restart unless-stopped \
+  wx-alert:latest
 ```
 
-Review logs:
+Follow logs:
 
 ```bash
-docker logs wx-alert
+docker logs -f wx-alert
 ```
 
-Remove the stopped one-shot container when finished:
+Stop it cleanly:
 
 ```bash
-docker rm wx-alert
+docker stop wx-alert
 ```
 
-For a disposable run:
+During one container run, an alert ID is notified only once. If ntfy delivery
+fails, that alert remains eligible for retry on the next check. This duplicate
+suppression is currently in memory and resets when the container restarts.
+
+## One-time check
+
+Override the Docker default command with `--ntfy --once`:
 
 ```bash
-docker run --rm wx-alert:latest
+docker run --rm wx-alert:latest --ntfy --once
+```
+
+## Override the check interval from the command line
+
+This does not change `config.ini`; it overrides it for this container run:
+
+```bash
+docker run --rm wx-alert:latest \
+  --ntfy --loop --check-interval 300
 ```
 
 ## Verbose notification and output
 
 Because an explicit Docker command replaces the Dockerfile `CMD`, include
-`--ntfy` when adding other normal-check options:
+`--ntfy --loop` when adding normal polling options:
 
 ```bash
-docker run --rm wx-alert:latest --ntfy --verbose
+docker run --rm wx-alert:latest --ntfy --loop --verbose
 ```
 
 ## Runtime config override
@@ -67,22 +98,30 @@ The default config is baked into the image. To supply a different config
 without rebuilding, mount it read-only:
 
 ```bash
-docker run --rm \
+docker run -d \
+  --name wx-alert \
+  --restart unless-stopped \
   --mount type=bind,src="$PWD/config.ini",dst=/app/config.ini,readonly \
   wx-alert:latest
 ```
 
 This is strongly recommended when `TOKEN` contains a secret.
 
-## Exit codes
+## Logs
 
-- `0`: successful check/test; no alerts is also success
-- `1`: NWS request or response failure
-- `2`: ntfy delivery/test failure or command/configuration error
+Operational logs are timestamped in UTC. Typical output includes:
 
-## Scheduling
+```text
+2026-07-14T20:00:00Z INFO Starting wx-alert mode=polling config=/app/config.ini
+2026-07-14T20:00:00Z INFO Polling enabled check_interval=3600 seconds
+2026-07-14T20:00:00Z INFO Beginning check cycle=1
+2026-07-14T20:00:01Z INFO NWS returned 2 active alert(s); 2 new alert(s)
+2026-07-14T20:00:03Z INFO Next NWS check in 3600 second(s)
+```
 
-The container performs one check and exits. Schedule it with host cron,
-a systemd timer, Kubernetes CronJob, or another scheduler. Persistent
-alert-ID tracking is not yet implemented, so repeated scheduled runs will
-re-send alerts that remain active.
+## Exit behavior
+
+- `--ntfy-test` sends one test notification and exits.
+- `--once` performs one check and exits.
+- `--loop` continues through temporary NWS or ntfy failures and exits cleanly
+  on `docker stop`, SIGTERM, or Ctrl-C.
