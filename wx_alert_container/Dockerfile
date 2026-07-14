@@ -1,26 +1,24 @@
-FROM python:3.13-slim-bookworm
+FROM dhi.io/python:3.13-dev AS build
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+WORKDIR /app
+RUN python -m venv /app/venv
+
+COPY requirements.txt .
+RUN /app/venv/bin/pip install \
+    --no-cache-dir \
+    --requirement requirements.txt
+
+
+FROM dhi.io/python:3.13
+
+ENV PATH="/app/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN groupadd --system wxalert \
-    && useradd --system --gid wxalert --home-dir /app --no-create-home wxalert
+COPY --from=build /app/venv /app/venv
+COPY get_alerts_ntfy.py config.ini /app/
 
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --requirement /app/requirements.txt
-
-COPY --chown=wxalert:wxalert get_alerts_ntfy.py config.ini /app/
-
-USER wxalert
-
-STOPSIGNAL SIGTERM
-
-# Default: run continuously, query NWS at CHECK_INTERVAL, and publish new
-# active alerts to ntfy. Test mode exits after one test notification:
-#   docker run --rm IMAGE --ntfy-test
 ENTRYPOINT ["python", "/app/get_alerts_ntfy.py", "--config", "/app/config.ini"]
 CMD ["--ntfy", "--loop"]
