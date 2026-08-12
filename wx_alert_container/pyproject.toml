@@ -1,0 +1,23 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import mode "importlib" avoids needing __init__.py in tests/ and keeps the
+# package importable from the build context root.
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:wx_alert.*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    # The transports deliberately catch broad exceptions: a bug in one must
+    # not take down the poll loop, and serial plus asyncio raise a wide
+    # variety of unrelated error types that all mean "retry later".
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into transport internals to assert on derived state.
+"tests/*" = ["SLF001"]

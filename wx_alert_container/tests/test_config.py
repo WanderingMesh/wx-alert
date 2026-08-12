@@ -1,0 +1,188 @@
+"""Configuration loading and validation.
+
+Validation failures must surface at startup. A container that refuses to boot
+is far easier to diagnose than one that polls for a week and delivers nothing.
+"""
+
+from __future__ import annotations
+
+import configparser
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from wx_alert.config import (
+    ConfigurationError,
+    load_configuration,
+    load_meshcore_configuration,
+    normalize_server_url,
+    read_config_file,
+)
+
+MINIMAL = """
+[weather]
+DEFAULT_LATITUDE = 39.5296
+DEFAULT_LONGITUDE = -119.8138
+
+[ntfy]
+TOPIC = a-topic
+
+[delivery]
+"""
+
+
+def parse(text: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(textwrap.dedent(text))
+    return parser
+
+
+class TestCoreConfiguration:
+    def test_loads_a_minimal_file(self):
+        config = load_configuration(parse(MINIMAL))
+        assert config.latitude == 39.5296
+        assert config.ntfy_topic == "a-topic"
+
+    def test_applies_documented_defaults(self):
+        config = load_configuration(parse(MINIMAL))
+        assert config.ntfy_server == "https://ntfy.sh"
+        assert config.ntfy_priority == "auto"
+        assert config.state_file == Path("/data/notified-alerts.json")
+
+    def test_a_blank_topic_becomes_none(self):
+        # The tracked config.ini ships with a blank topic, and "" must not be
+        # mistaken for a configured value.
+        config = load_configuration(parse(MINIMAL.replace("a-topic", "")))
+        assert config.ntfy_topic is None
+
+    @pytest.mark.parametrize(
+        ("section", "option", "value"),
+        [
+            ("weather", "DEFAULT_LATITUDE", "91"),
+            ("weather", "DEFAULT_LATITUDE", "not-a-number"),
+            ("weather", "DEFAULT_LONGITUDE", "-181"),
+            ("ntfy", "PRIORITY", "loud"),
+            ("ntfy", "SERVER", "ntfy.sh"),
+            ("delivery", "DELAY_SECONDS", "0"),
+            ("delivery", "DELAY_SECONDS", "61"),
+            ("delivery", "CHECK_INTERVAL", "4"),
+            ("delivery", "CHECK_INTERVAL", "3601"),
+            ("delivery", "STARTUP_MAX_AGE_SECONDS", "-1"),
+            ("delivery", "EXIT_AFTER_FAILED_CYCLES", "-1"),
+        ],
+    )
+    def test_rejects_invalid_values(self, section, option, value):
+        parser = parse(MINIMAL)
+        if not parser.has_section(section):
+            parser.add_section(section)
+        parser.set(section, option, value)
+
+        with pytest.raises(ConfigurationError):
+            load_configuration(parser)
+
+    @pytest.mark.parametrize("section", ["weather", "ntfy", "delivery"])
+    def test_requires_core_sections(self, section):
+        parser = parse(MINIMAL)
+        parser.remove_section(section)
+        with pytest.raises(ConfigurationError, match=section):
+            load_configuration(parser)
+
+    def test_state_section_is_optional(self):
+        assert load_configuration(parse(MINIMAL)).state_retention_days == 14
+
+    def test_rejects_an_out_of_range_retention(self):
+        parser = parse(MINIMAL + "\n[state]\nRETENTION_DAYS = 0\n")
+        with pytest.raises(ConfigurationError):
+            load_configuration(parser)
+
+
+class TestServerUrl:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("https://ntfy.sh/", "https://ntfy.sh"),
+            ("  http://local:8080  ", "http://local:8080"),
+        ],
+    )
+    def test_normalizes(self, raw, expected):
+        assert normalize_server_url(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["ntfy.sh", "ftp://ntfy.sh", "https://", ""])
+    def test_rejects_malformed(self, raw):
+        with pytest.raises(ConfigurationError):
+            normalize_server_url(raw)
+
+
+class TestMeshCoreConfiguration:
+    def test_absent_section_disables_the_transport(self):
+        assert not load_meshcore_configuration(parse(MINIMAL)).enabled
+
+    def test_defaults_are_conservative(self):
+        # Airtime is shared, so the out-of-box posture should carry only
+        # products that are actually happening.
+        mesh = load_meshcore_configuration(parse(MINIMAL))
+        assert mesh.minimum_class == "warning"
+        assert mesh.minimum_severity == "severe"
+        assert mesh.max_per_hour > 0
+        assert mesh.min_interval_seconds > 0
+
+    def test_reads_a_full_section(self):
+        mesh = load_meshcore_configuration(
+            parse(
+                MINIMAL
+                + """
+                [meshcore]
+                ENABLED = true
+                PORT = /dev/meshcore
+                CHANNEL_INDEX = 2
+                MIN_CLASS = watch
+                MIN_SEVERITY = moderate
+                MAX_SENDS_PER_HOUR = 6
+                """
+            )
+        )
+        assert mesh.enabled
+        assert mesh.port == "/dev/meshcore"
+        assert mesh.channel_index == 2
+        assert mesh.minimum_class == "watch"
+        assert mesh.max_per_hour == 6
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("MIN_CLASS", "bogus"),
+            ("MIN_SEVERITY", "bogus"),
+            ("CHANNEL_INDEX", "256"),
+            ("CHANNEL_INDEX", "-1"),
+            ("BAUD", "0"),
+            ("MAX_SENDS_PER_HOUR", "-1"),
+            ("MIN_SECONDS_BETWEEN_SENDS", "-1"),
+            ("ENABLED", "maybe"),
+        ],
+    )
+    def test_rejects_invalid_values(self, option, value):
+        parser = parse(MINIMAL + "\n[meshcore]\n")
+        parser.set("meshcore", option, value)
+        with pytest.raises(ConfigurationError):
+            load_meshcore_configuration(parser)
+
+
+class TestReadConfigFile:
+    def test_reports_a_missing_file(self, tmp_path):
+        with pytest.raises(ConfigurationError, match="not found"):
+            read_config_file(tmp_path / "absent.ini")
+
+    def test_reports_malformed_ini(self, tmp_path):
+        path = tmp_path / "bad.ini"
+        path.write_text("this is not ini", encoding="utf-8")
+        with pytest.raises(ConfigurationError):
+            read_config_file(path)
+
+    def test_the_shipped_config_is_valid(self):
+        # The tracked config.ini is baked into the image, so a mistake in it
+        # breaks every deployment.
+        path = Path(__file__).resolve().parent.parent / "config.ini"
+        config = load_configuration(read_config_file(path))
+        assert config.ntfy_topic is None, "the template must not carry a real topic"
+        assert config.ntfy_token is None, "the template must not carry a real token"
