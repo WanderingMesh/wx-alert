@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 from .config import (
+    MAX_MESHCORE_REPEAT_SENDS,
     NTFY_PRIORITY_CHOICES,
     ConfigurationError,
     load_configuration,
@@ -309,10 +310,40 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    mesh.add_argument(
+        "--meshcore-repeat",
+        type=int,
+        default=config.meshcore.repeat_sends,
+        metavar="COUNT",
+        help=(
+            "Number of times each message is transmitted. Channel messages "
+            "are unacknowledged, so a second copy is the only defence against "
+            "a lost one, at the cost of a duplicate for receivers. 1 disables "
+            f"repeating. Configured default: {config.meshcore.repeat_sends}."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-reset",
+        action="store_true",
+        help=(
+            "Reboot the radio over its serial control lines and exit. Use "
+            "this when the firmware has hung: the USB device still exists and "
+            "the port still opens, but the radio never answers. Recovers a "
+            "remote host over SSH without physical access."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.ntfy and args.ntfy_test:
         parser.error("--ntfy and --ntfy-test cannot be used together")
+
+    if not 1 <= args.meshcore_repeat <= MAX_MESHCORE_REPEAT_SENDS:
+        parser.error(
+            "--meshcore-repeat must be between 1 and "
+            f"{MAX_MESHCORE_REPEAT_SENDS}"
+        )
 
     if (args.ntfy or args.ntfy_test) and not clean_optional(args.ntfy_topic):
         parser.error(
@@ -331,8 +362,15 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "required when MeshCore is enabled"
         )
 
-    if args.meshcore_test and args.ntfy_test:
-        parser.error("--meshcore-test and --ntfy-test cannot be used together")
+    if args.meshcore_reset and not args.meshcore_port:
+        parser.error(
+            "[meshcore] PORT in the config file, or --meshcore-port, is "
+            "required by --meshcore-reset"
+        )
+
+    # --meshcore-test and --ntfy-test deliberately combine: verifying that a
+    # radio failure still leaves ntfy working requires exercising both in the
+    # same run.
 
     # Catching this here means an operator who mistypes a flag gets an error
     # rather than a container that polls NWS forever and delivers nothing.

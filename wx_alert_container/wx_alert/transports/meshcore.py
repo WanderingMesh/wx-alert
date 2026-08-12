@@ -13,20 +13,25 @@ A channel message is also fundamentally unlike an HTTP POST. It is a broadcast
 with no acknowledgement, so `OK` from the radio means only that the frame was
 accepted for transmission. Nothing here can ever report that a human received
 anything, and the wording throughout says "transmitted" rather than
-"delivered" for that reason.
+"delivered" for that reason. Because nothing is acknowledged, nothing can be
+retried on demand either: the only defence against a lost message is to send
+it more than once and accept that receivers may see it twice.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
 from ..mesh_format import build_mesh_message, mesh_text_budget
 from ..policy import StartupPolicy, should_suppress_on_startup
+from ..radio import RadioResetError, hard_reset
 from ..ratelimit import RateLimiter, RelevanceFilter
+from ..shutdown import STOP_EVENT
 from ..text import clean_field
 from .base import DeliveryContext, DeliveryResult, TransportError
 
@@ -68,9 +73,31 @@ class _AsyncBridge:
             raise TimeoutError(f"operation did not complete within {timeout}s")
 
     def shutdown(self) -> None:
+        # The meshcore library leaves a reader task running on the loop.
+        # Closing the loop without cancelling it first makes asyncio print
+        # "Task was destroyed but it is pending!", which looks like a crash
+        # and is deeply misleading in the logs of a failed radio connection.
+        self._cancel_pending_tasks()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
         self._loop.close()
+
+    def _cancel_pending_tasks(self) -> None:
+        async def cancel_all() -> None:
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(cancel_all(), self._loop).result(5)
+        except Exception as exc:  # noqa: BLE001 - this is best-effort cleanup
+            # on a loop that may already be stopping.
+            LOGGER.debug("Error cancelling MeshCore tasks: %s", exc)
 
 
 class MeshCoreTransport:
@@ -89,6 +116,11 @@ class MeshCoreTransport:
         startup_policy: StartupPolicy,
         connect_timeout: float = 30.0,
         send_timeout: float = 30.0,
+        repeat_sends: int = 1,
+        repeat_min_delay: float = 1.0,
+        repeat_max_delay: float = 12.0,
+        auto_reset: bool = True,
+        reset_settle: float = 3.0,
         dry_run: bool = False,
         debug: bool = False,
     ) -> None:
@@ -100,6 +132,11 @@ class MeshCoreTransport:
         self._startup_policy = startup_policy
         self._connect_timeout = connect_timeout
         self._send_timeout = send_timeout
+        self._repeat_sends = max(1, repeat_sends)
+        self._repeat_min_delay = repeat_min_delay
+        self._repeat_max_delay = repeat_max_delay
+        self._auto_reset = auto_reset
+        self._reset_settle = reset_settle
         self._dry_run = dry_run
         self._debug = debug
 
@@ -110,16 +147,16 @@ class MeshCoreTransport:
 
     # -- connection management -------------------------------------------
 
-    def _connect(self) -> None:
-        """Open the serial port and learn what we need from the radio."""
-        from meshcore import EventType, MeshCore
+    def _open(self) -> Any:
+        """Attempt one connection. Returns None when the radio does not answer."""
+        from meshcore import MeshCore
 
         if self._bridge is None:
             self._bridge = _AsyncBridge()
 
         # create_serial returns None rather than raising when the device does
         # not answer, so the None check is load-bearing.
-        meshcore = self._bridge.call(
+        return self._bridge.call(
             MeshCore.create_serial(
                 self._port,
                 self._baud,
@@ -131,6 +168,36 @@ class MeshCoreTransport:
             ),
             timeout=self._connect_timeout,
         )
+
+    def _connect(self) -> None:
+        """Open the serial port and learn what we need from the radio."""
+        from meshcore import EventType
+
+        meshcore = self._open()
+
+        # A silent radio behind a perfectly healthy device node means the
+        # firmware has hung. Restarting the container cannot fix that, because
+        # the device node is not the problem, so reboot the radio itself.
+        if meshcore is None and self._auto_reset:
+            LOGGER.warning(
+                "No response from the radio on %s; the firmware appears hung, "
+                "attempting a hard reset",
+                self._port,
+            )
+            try:
+                hard_reset(
+                    self._port,
+                    settle=self._reset_settle,
+                    sleep=STOP_EVENT.wait,
+                )
+            except RadioResetError as exc:
+                # Report the original symptom, not the recovery failure: the
+                # radio being unreachable is what the operator needs to fix.
+                LOGGER.error("Hard reset failed error=%s", exc)
+            else:
+                meshcore = self._open()
+                if meshcore is not None:
+                    LOGGER.info("Radio recovered after a hard reset")
 
         if meshcore is None:
             raise TransportError(
@@ -209,13 +276,30 @@ class MeshCoreTransport:
         self._connect()
 
     def selftest(self) -> None:
-        self._ensure_connected()
         text = "wx-alert test. No NWS alert was required for this message."
-        self._transmit(text)
+
+        # start() and deliver() both honour the dry run, and this has to as
+        # well, or --meshcore-dry-run would open the port it promises not to.
+        if self._dry_run:
+            LOGGER.info(
+                "MeshCore dry-run self-test channel=%d bytes=%d copies=%d "
+                "text=%r",
+                self._channel_index,
+                len(text.encode("utf-8")),
+                self._repeat_sends,
+                text,
+            )
+            return
+
+        self._ensure_connected()
+        # Deliberately the same path a real alert takes, repeats included, so
+        # the test proves what will actually happen rather than a simpler case.
+        copies = self._transmit_burst(text)
         LOGGER.info(
-            "MeshCore test transmitted channel=%d bytes=%d",
+            "MeshCore test transmitted channel=%d bytes=%d copies=%d",
             self._channel_index,
             len(text.encode("utf-8")),
+            copies,
         )
 
     def deliver(
@@ -260,7 +344,7 @@ class MeshCoreTransport:
 
         try:
             self._ensure_connected()
-            self._transmit(text)
+            copies = self._transmit_burst(text)
         except TransportError as exc:
             self._drop_connection()
             return DeliveryResult.FAILED, str(exc)
@@ -272,17 +356,22 @@ class MeshCoreTransport:
         self._rate_limiter.record(context.now)
 
         LOGGER.info(
-            "MeshCore transmitted event=%r channel=%d bytes=%d/%d text=%r",
+            "MeshCore transmitted event=%r channel=%d bytes=%d/%d copies=%d "
+            "text=%r",
             event,
             self._channel_index,
             size,
             self._budget,
+            copies,
             text,
         )
 
         # "transmitted", not "delivered": a channel message is an
         # unacknowledged broadcast and nothing here can confirm reception.
-        return DeliveryResult.SENT, f"transmitted bytes={size}/{self._budget}"
+        return (
+            DeliveryResult.SENT,
+            f"transmitted bytes={size}/{self._budget} copies={copies}",
+        )
 
     def close(self) -> None:
         self._drop_connection()
@@ -292,6 +381,66 @@ class MeshCoreTransport:
             self._bridge = None
 
     # -- internals --------------------------------------------------------
+
+    def _repeat_delay(self) -> float:
+        """Pick the gap before the next copy.
+
+        Randomised rather than fixed for two reasons. A constant gap can
+        phase-lock with another periodic sender on the channel, so a pair of
+        transmissions that collide once will collide again on every repeat;
+        jitter decorrelates them. It also spreads the load when several alerts
+        are dispatched close together.
+        """
+        low = min(self._repeat_min_delay, self._repeat_max_delay)
+        high = max(self._repeat_min_delay, self._repeat_max_delay)
+        return random.uniform(low, high)
+
+    def _transmit_burst(self, text: str) -> int:
+        """Send the same text more than once. Returns the number of copies.
+
+        Channel messages are unacknowledged, so a lost one is lost silently and
+        cannot be detected, let alone retried on demand. Sending a second copy
+        is the only available defence, and it costs receivers a duplicate.
+
+        The repeat works only because the gap is at least a second. The
+        firmware stamps each message with the current epoch second, and
+        repeaters suppress flood packets they have already forwarded by hash.
+        Two copies sent within the same second would hash identically and the
+        mesh itself would discard the second one, making the whole exercise
+        pointless.
+        """
+        self._transmit(text)
+        copies = 1
+
+        while copies < self._repeat_sends:
+            if STOP_EVENT.wait(self._repeat_delay()):
+                LOGGER.info(
+                    "Stop requested; skipping %d remaining mesh repeat(s)",
+                    self._repeat_sends - copies,
+                )
+                break
+
+            try:
+                self._transmit(text)
+            except Exception as exc:  # noqa: BLE001 - any failure here is
+                # survivable, so it is logged rather than raised.
+                #
+                # The message already went out once. Reporting the delivery as
+                # failed would put the alert back in the queue and transmit the
+                # whole burst again next cycle, so a flaky repeat would produce
+                # more duplicates rather than fewer.
+                LOGGER.warning(
+                    "MeshCore repeat %d/%d failed; the first copy was already "
+                    "transmitted error=%s",
+                    copies + 1,
+                    self._repeat_sends,
+                    exc,
+                )
+                break
+
+            copies += 1
+
+        return copies
 
     def _transmit(self, text: str) -> None:
         from meshcore import EventType

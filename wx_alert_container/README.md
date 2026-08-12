@@ -79,6 +79,17 @@ ntfy receives everything, with the priority mapped from the alert. MeshCore
 receives only what clears `MIN_CLASS` and `MIN_SEVERITY`, which default to
 warnings at severe or above.
 
+They also differ in how much you can trust them. **ntfy is the reliable path**:
+it runs over TCP, the server acknowledges each publish, and a failure is
+visible and retried. **The radio is best effort**: channel messages are
+unacknowledged broadcasts that can vanish without a trace. Treat the mesh as a
+bonus that reaches people without internet, not as the channel you rely on to
+know a warning was received.
+
+The two are fully independent. A radio failure never suppresses or delays an
+ntfy notification, and delivery is tracked per transport, so a radio that is
+failing and retrying does not re-send anything on ntfy.
+
 Alerts are classified by product name rather than by CAP severity, because
 severity alone is misleading. NWS routinely issues a Flood Watch with
 `severity=Severe`, and a severity-only mapping would announce it exactly as
@@ -238,6 +249,33 @@ airtime.
 > program can confirm that anyone received it, which is why logs say
 > "transmitted" rather than "delivered".
 
+### Repeated transmission
+
+Because nothing is acknowledged, a lost message is lost silently. There is no
+delivery report to react to and no failure to retry. During bring-up on a busy
+channel, one of four test messages simply never arrived.
+
+The only available defence is to send each message more than once, so
+`REPEAT_SENDS` defaults to 2. This is a real trade-off and not a free win:
+everyone on the channel sees each alert twice, and airtime doubles.
+`MAX_SENDS_PER_HOUR` counts *alerts*, not transmissions, so the default of 12
+alerts per hour is up to 24 transmissions. Set `REPEAT_SENDS = 1` to disable.
+
+The gap between copies is randomised between `REPEAT_MIN_DELAY` and
+`REPEAT_MAX_DELAY` rather than fixed. A constant gap can phase-lock with
+another periodic sender, so two transmissions that collide once would collide
+again on every repeat; jitter decorrelates them.
+
+`REPEAT_MIN_DELAY` may not be less than one second, and startup fails if it
+is. The firmware stamps each message with the current epoch second, and
+repeaters discard flood packets whose hash they have already forwarded. Two
+copies sent inside the same second are byte-identical, so the mesh would drop
+the repeat and the setting would silently accomplish nothing.
+
+A repeat that fails is logged but does not fail the delivery. The alert
+already went out once, and reporting failure would requeue it and retransmit
+the entire burst on the next cycle — producing more duplicates, not fewer.
+
 ---
 
 ## Persistent state
@@ -282,6 +320,35 @@ recreating the container against the current device will.
 docker inspect --format '{{.State.Health.Status}}' wx-alert
 ```
 
+### A hung radio, which restarting cannot fix
+
+There is a second failure mode, and restarting the container is useless
+against it. The companion firmware can stop responding while the USB device
+stays present and the serial port still opens normally. Nothing about the
+device node is wrong, so a recreated container connects to the same hung radio
+and fails again, forever.
+
+This was observed in practice: the radio went silent mid-session, the port
+stayed free, `/dev/serial/by-id/` was unchanged, and the kernel logged no USB
+reset. Reconnecting failed repeatedly for about ten minutes.
+
+ESP32 boards wire the USB bridge's RTS line to the chip's reset pin, which is
+how esptool reboots a board without anyone touching it. Driving that line
+recovers the radio in place. The transport does this automatically when a
+connection attempt gets no answer, controlled by `HARD_RESET_ON_HANG`.
+
+To do it by hand, including over SSH on a headless host:
+
+```bash
+docker compose run --rm wx-alert --meshcore-reset
+docker compose run --rm wx-alert --meshcore-test   # confirm it came back
+```
+
+The reset boots the application, not the ROM bootloader: DTR is held
+deasserted so GPIO0 stays high while only RTS is pulsed. Reversing that would
+strand the radio in the bootloader, where it answers nothing until someone
+physically power-cycles it.
+
 ---
 
 ## Container image
@@ -321,6 +388,17 @@ docker compose run --rm wx-alert --ntfy --once
 
 # Test ntfy without querying NWS
 docker compose run --rm wx-alert --ntfy-test
+
+# Test both transports in one run. Each is reported separately, so a radio
+# failure still shows whether ntfy worked.
+docker compose run --rm wx-alert --ntfy-test --meshcore-test
+
+# Reboot a hung radio, then confirm it answers again
+docker compose run --rm wx-alert --meshcore-reset
+docker compose run --rm wx-alert --meshcore-test
+
+# Transmit each message once instead of twice, for this run only
+docker compose run --rm wx-alert --meshcore --once --meshcore-repeat 1
 
 # Full alert text to stdout and to ntfy
 docker compose run --rm wx-alert --ntfy --loop --verbose
@@ -373,6 +451,7 @@ wx_alert/
   ratelimit.py    relevance filter and airtime rate limiter
   formatting.py   stdout and ntfy rendering
   mesh_format.py  byte-budgeted rendering for LoRa
+  radio.py        serial hard reset for a hung companion radio
   health.py       heartbeat and HEALTHCHECK entry point
   transports/     base protocol, ntfy, meshcore
 ```

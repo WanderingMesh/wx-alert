@@ -38,6 +38,23 @@ DEFAULT_MESHCORE_STARTUP_MAX_AGE = 900
 DEFAULT_MESHCORE_SEND_TIMEOUT = 30
 DEFAULT_MESHCORE_CONNECT_TIMEOUT = 30
 
+# Each alert is transmitted twice by default. Channel messages are
+# unacknowledged, so a single copy that collides with other traffic is lost
+# with no way to detect it. The cost is that receivers see the message twice.
+DEFAULT_MESHCORE_REPEAT_SENDS = 2
+
+# The gap must be at least one second: the firmware stamps each message with
+# the current epoch second, and two copies sharing a timestamp hash the same,
+# so repeaters would discard the second copy as an already-forwarded flood
+# packet. An upper bound keeps the transport from holding the poll cycle open.
+DEFAULT_MESHCORE_REPEAT_MIN_DELAY = 1
+DEFAULT_MESHCORE_REPEAT_MAX_DELAY = 12
+MAX_MESHCORE_REPEAT_SENDS = 5
+MAX_MESHCORE_REPEAT_DELAY = 120
+
+DEFAULT_MESHCORE_AUTO_RESET = True
+DEFAULT_MESHCORE_RESET_SETTLE = 3
+
 NTFY_PRIORITY_CHOICES = (
     "auto",
     "min",
@@ -68,6 +85,11 @@ class MeshCoreConfiguration:
     startup_max_age: int
     connect_timeout: int
     send_timeout: int
+    repeat_sends: int
+    repeat_min_delay: int
+    repeat_max_delay: int
+    auto_reset: bool
+    reset_settle: int
 
 
 @dataclass(frozen=True)
@@ -191,6 +213,40 @@ def load_meshcore_configuration(
     if baud <= 0:
         raise ConfigurationError("[meshcore] BAUD must be a positive integer")
 
+    repeat_sends = _read_int(
+        parser, "meshcore", "REPEAT_SENDS", DEFAULT_MESHCORE_REPEAT_SENDS
+    )
+    if not 1 <= repeat_sends <= MAX_MESHCORE_REPEAT_SENDS:
+        raise ConfigurationError(
+            "[meshcore] REPEAT_SENDS must be between 1 and "
+            f"{MAX_MESHCORE_REPEAT_SENDS}; 1 disables repeating"
+        )
+
+    repeat_min_delay = _read_int(
+        parser, "meshcore", "REPEAT_MIN_DELAY", DEFAULT_MESHCORE_REPEAT_MIN_DELAY
+    )
+    repeat_max_delay = _read_int(
+        parser, "meshcore", "REPEAT_MAX_DELAY", DEFAULT_MESHCORE_REPEAT_MAX_DELAY
+    )
+
+    # Below a second, both copies carry the same timestamp, hash identically,
+    # and the mesh drops the repeat as a duplicate flood packet.
+    if repeat_min_delay < 1:
+        raise ConfigurationError(
+            "[meshcore] REPEAT_MIN_DELAY must be at least 1 second, or "
+            "repeated copies are discarded by the mesh as duplicates"
+        )
+    if repeat_max_delay < repeat_min_delay:
+        raise ConfigurationError(
+            "[meshcore] REPEAT_MAX_DELAY must be greater than or equal to "
+            "REPEAT_MIN_DELAY"
+        )
+    if repeat_max_delay > MAX_MESHCORE_REPEAT_DELAY:
+        raise ConfigurationError(
+            "[meshcore] REPEAT_MAX_DELAY must be at most "
+            f"{MAX_MESHCORE_REPEAT_DELAY} seconds"
+        )
+
     return MeshCoreConfiguration(
         enabled=enabled,
         port=port,
@@ -242,6 +298,21 @@ def load_meshcore_configuration(
                 DEFAULT_MESHCORE_SEND_TIMEOUT,
             ),
             "[meshcore] SEND_TIMEOUT",
+        ),
+        repeat_sends=repeat_sends,
+        repeat_min_delay=repeat_min_delay,
+        repeat_max_delay=repeat_max_delay,
+        auto_reset=_read_bool(
+            parser, "meshcore", "HARD_RESET_ON_HANG", DEFAULT_MESHCORE_AUTO_RESET
+        ),
+        reset_settle=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "HARD_RESET_SETTLE",
+                DEFAULT_MESHCORE_RESET_SETTLE,
+            ),
+            "[meshcore] HARD_RESET_SETTLE",
         ),
     )
 

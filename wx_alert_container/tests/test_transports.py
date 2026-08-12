@@ -362,3 +362,223 @@ class TestMeshCoreFailureHandling:
         transport.start()
         transport.close()
         transport.close()
+
+
+# --------------------------------------------------------------------------
+# Repeated transmission
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_repeat_delay(monkeypatch):
+    """Collapse the random gap so tests do not wait real seconds."""
+    delays = []
+
+    def instant(low, high):
+        delays.append((low, high))
+        return 0.0
+
+    monkeypatch.setattr("wx_alert.transports.meshcore.random.uniform", instant)
+    return delays
+
+
+@pytest.fixture
+def stop_event():
+    """Hand back the global stop flag, always cleared afterwards."""
+    from wx_alert.shutdown import STOP_EVENT
+
+    STOP_EVENT.clear()
+    yield STOP_EVENT
+    STOP_EVENT.clear()
+
+
+class TestMeshCoreRepeats:
+    def test_sends_one_copy_by_default(self, make_transport, radio,
+                                       fresh_warning, now):
+        transport = make_transport()
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+        assert len(radio.sent) == 1
+
+    def test_sends_the_configured_number_of_copies(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        transport = make_transport(repeat_sends=2)
+        transport.start()
+
+        result, detail = transport.deliver(
+            fresh_warning, DeliveryContext(False, now)
+        )
+
+        assert result is DeliveryResult.SENT
+        assert "copies=2" in detail
+        assert len(radio.sent) == 2
+
+    def test_every_copy_is_identical(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        transport = make_transport(repeat_sends=3)
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert len({message for _channel, message in radio.sent}) == 1
+
+    def test_repeating_consumes_only_one_unit_of_airtime_budget(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        # The cap counts alerts, not transmissions. Charging per copy would
+        # silently halve the alert rate the operator configured.
+        limiter = RateLimiter(min_interval_seconds=0, max_per_hour=2)
+        transport = make_transport(repeat_sends=2, rate_limiter=limiter)
+        transport.start()
+
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert len(radio.sent) == 2
+        assert limiter.check(now)[0]
+
+    def test_the_gap_stays_within_the_configured_range(self, make_transport):
+        transport = make_transport(repeat_min_delay=1, repeat_max_delay=12)
+        for _ in range(50):
+            assert 1 <= transport._repeat_delay() <= 12
+
+    def test_reversed_bounds_do_not_produce_a_negative_gap(self, make_transport):
+        transport = make_transport(repeat_min_delay=9, repeat_max_delay=2)
+        assert 2 <= transport._repeat_delay() <= 9
+
+    def test_a_failed_repeat_still_reports_success(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        # The alert did go out. Reporting failure would requeue it and
+        # retransmit the whole burst, producing more duplicates, not fewer.
+        transport = make_transport(repeat_sends=2)
+        transport.start()
+
+        original = transport._transmit
+        calls = {"n": 0}
+
+        def fail_on_repeat(text):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("radio went away")
+            original(text)
+
+        transport._transmit = fail_on_repeat
+
+        result, detail = transport.deliver(
+            fresh_warning, DeliveryContext(False, now)
+        )
+
+        assert result is DeliveryResult.SENT
+        assert "copies=1" in detail
+
+    def test_a_failed_first_send_reports_failure(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        transport = make_transport(repeat_sends=2)
+        transport.start()
+        radio.reject_next = True
+
+        result, _ = transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert result is DeliveryResult.FAILED
+        assert radio.sent == []
+
+    def test_shutdown_abandons_the_remaining_copies(
+        self, make_transport, radio, fresh_warning, now, stop_event
+    ):
+        # A pending repeat must not hold the container open past its stop
+        # grace period, or Docker escalates to SIGKILL.
+        transport = make_transport(repeat_sends=3)
+        transport.start()
+        stop_event.set()
+
+        result, detail = transport.deliver(
+            fresh_warning, DeliveryContext(False, now)
+        )
+
+        assert result is DeliveryResult.SENT
+        assert "copies=1" in detail
+        assert len(radio.sent) == 1
+
+
+# --------------------------------------------------------------------------
+# Recovering a hung radio
+# --------------------------------------------------------------------------
+
+
+class TestMeshCoreHangRecovery:
+    @pytest.fixture
+    def hung_once(self, monkeypatch, radio):
+        """A radio that ignores the first connection, then answers."""
+        import types
+
+        import meshcore as meshcore_pkg
+
+        state = {"attempts": 0}
+
+        async def flaky_create_serial(port, baud=115200, **kwargs):
+            state["attempts"] += 1
+            return None if state["attempts"] == 1 else radio
+
+        monkeypatch.setattr(
+            meshcore_pkg,
+            "MeshCore",
+            types.SimpleNamespace(create_serial=flaky_create_serial),
+            raising=False,
+        )
+        return state
+
+    @pytest.fixture
+    def recorded_reset(self, monkeypatch):
+        resets = []
+        monkeypatch.setattr(
+            "wx_alert.transports.meshcore.hard_reset",
+            lambda port, **kwargs: resets.append(port),
+        )
+        return resets
+
+    def test_resets_the_radio_when_it_does_not_answer(
+        self, make_transport, hung_once, recorded_reset
+    ):
+        # A silent radio behind a healthy device node is the case a container
+        # restart cannot fix, so the transport has to reboot the hardware.
+        transport = make_transport()
+        transport.start()
+
+        assert recorded_reset == ["/dev/fake"]
+        assert transport._meshcore is not None
+
+    def test_does_not_reset_when_disabled(
+        self, make_transport, hung_once, recorded_reset
+    ):
+        transport = make_transport(auto_reset=False)
+        with pytest.raises(TransportError, match="no response"):
+            transport.start()
+        assert recorded_reset == []
+
+    def test_reports_the_original_fault_when_the_reset_does_not_help(
+        self, make_transport, monkeypatch, recorded_reset
+    ):
+        transport = make_transport(port="/dev/absent")
+
+        with pytest.raises(TransportError, match="no response"):
+            transport.start()
+
+        assert recorded_reset == ["/dev/absent"]
+
+    def test_a_reset_failure_does_not_mask_the_real_problem(
+        self, make_transport, monkeypatch
+    ):
+        from wx_alert.radio import RadioResetError
+
+        def explode(port, **kwargs):
+            raise RadioResetError("permission denied")
+
+        monkeypatch.setattr("wx_alert.transports.meshcore.hard_reset", explode)
+        transport = make_transport(port="/dev/absent")
+
+        # The operator needs to know the radio is unreachable, which is the
+        # actionable fault; the failed recovery attempt is a detail.
+        with pytest.raises(TransportError, match="no response"):
+            transport.start()

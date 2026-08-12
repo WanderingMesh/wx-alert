@@ -135,6 +135,52 @@ class TestDeliverAlert:
         assert state.is_settled(flood_watch, CONSOLE_TRANSPORT_NAME)
 
 
+class TestNtfyRemainsReliableWhileTheRadioFails:
+    """ntfy is the dependable path; the mesh is best effort.
+
+    A channel broadcast is unacknowledged and can vanish, so the radio is
+    expected to fail and retry. None of that may degrade ntfy, which is what
+    makes it a usable fallback.
+    """
+
+    def test_a_retrying_radio_does_not_resend_on_ntfy(self, flood_watch, context):
+        # The failure that matters: retrying the radio re-offers the alert, and
+        # if settlement were global rather than per transport the operator
+        # would get a duplicate push notification on every retry.
+        state = AlertState()
+        ntfy = RecordingTransport("ntfy")
+        mesh = RecordingTransport("meshcore", DeliveryResult.FAILED, "no radio")
+
+        for _ in range(3):
+            deliver_alert(flood_watch, [ntfy, mesh], state, context)
+
+        assert len(ntfy.delivered) == 1
+        assert len(mesh.delivered) == 3
+        assert state.is_settled(flood_watch, "ntfy")
+        assert not state.is_settled(flood_watch, "meshcore")
+
+    def test_ntfy_still_delivers_when_the_radio_raises(self, flood_watch, context):
+        state = AlertState()
+        mesh = RecordingTransport("meshcore", RuntimeError("serial port vanished"))
+        ntfy = RecordingTransport("ntfy")
+
+        # Radio first, so an unhandled exception would abort before ntfy ran.
+        deliver_alert(flood_watch, [mesh, ntfy], state, context)
+
+        assert len(ntfy.delivered) == 1
+        assert state.is_settled(flood_watch, "ntfy")
+
+    def test_a_radio_that_skips_does_not_suppress_ntfy(self, flood_watch, context):
+        # The radio filters hard by class and severity, so most alerts never
+        # reach it. Those must still go out over ntfy.
+        state = AlertState()
+        mesh = RecordingTransport("meshcore", DeliveryResult.SKIPPED, "filtered")
+        ntfy = RecordingTransport("ntfy")
+
+        assert deliver_alert(flood_watch, [mesh, ntfy], state, context) == 0
+        assert len(ntfy.delivered) == 1
+
+
 class TestProcessAlerts:
     def test_persists_after_each_alert(self, args, flood_watch, context, capsys):
         # A crash between two deliveries would otherwise replay the ones

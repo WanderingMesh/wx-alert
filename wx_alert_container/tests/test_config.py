@@ -148,6 +148,48 @@ class TestMeshCoreConfiguration:
         assert mesh.minimum_class == "watch"
         assert mesh.max_per_hour == 6
 
+    def test_repeats_each_message_by_default(self):
+        # Channel messages are unacknowledged, so one copy can vanish with no
+        # way to notice.
+        mesh = load_meshcore_configuration(parse(MINIMAL))
+        assert mesh.repeat_sends == 2
+        assert mesh.repeat_min_delay >= 1
+        assert mesh.repeat_max_delay >= mesh.repeat_min_delay
+
+    def test_recovers_a_hung_radio_by_default(self):
+        assert load_meshcore_configuration(parse(MINIMAL)).auto_reset
+
+    def test_a_sub_second_repeat_gap_is_rejected(self):
+        # Both copies would carry the same timestamp, hash identically, and
+        # the mesh would discard the repeat as an already-forwarded packet.
+        # Accepting this would make the setting silently do nothing.
+        with pytest.raises(ConfigurationError, match="at least 1 second"):
+            load_meshcore_configuration(
+                parse(MINIMAL + "\n[meshcore]\nREPEAT_MIN_DELAY = 0\n")
+            )
+
+    def test_a_reversed_repeat_range_is_rejected(self):
+        with pytest.raises(ConfigurationError, match="REPEAT_MAX_DELAY"):
+            load_meshcore_configuration(
+                parse(
+                    MINIMAL
+                    + "\n[meshcore]\nREPEAT_MIN_DELAY = 10\nREPEAT_MAX_DELAY = 2\n"
+                )
+            )
+
+    @pytest.mark.parametrize("value", ["0", "6", "-1"])
+    def test_an_out_of_range_repeat_count_is_rejected(self, value):
+        with pytest.raises(ConfigurationError, match="REPEAT_SENDS"):
+            load_meshcore_configuration(
+                parse(MINIMAL + f"\n[meshcore]\nREPEAT_SENDS = {value}\n")
+            )
+
+    def test_repeating_can_be_turned_off(self):
+        mesh = load_meshcore_configuration(
+            parse(MINIMAL + "\n[meshcore]\nREPEAT_SENDS = 1\n")
+        )
+        assert mesh.repeat_sends == 1
+
     @pytest.mark.parametrize(
         ("option", "value"),
         [

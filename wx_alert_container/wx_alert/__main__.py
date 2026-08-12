@@ -12,6 +12,7 @@ import requests
 from .app import STATUS_DELIVERY_FAILURE, STATUS_STATE_FAILURE, run_polling_loop
 from .cli import parse_arguments
 from .policy import StartupPolicy
+from .radio import RadioResetError, hard_reset
 from .ratelimit import RateLimiter, RelevanceFilter
 from .shutdown import install_signal_handlers
 from .state import StateError, load_state
@@ -89,6 +90,11 @@ def build_transports(
                 ),
                 connect_timeout=mesh.connect_timeout,
                 send_timeout=mesh.send_timeout,
+                repeat_sends=args.meshcore_repeat,
+                repeat_min_delay=mesh.repeat_min_delay,
+                repeat_max_delay=mesh.repeat_max_delay,
+                auto_reset=mesh.auto_reset,
+                reset_settle=mesh.reset_settle,
                 dry_run=args.meshcore_dry_run,
                 debug=args.verbose,
             )
@@ -101,6 +107,19 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = parse_arguments(argv)
     install_signal_handlers()
+
+    # Handled before anything else: the point of this mode is to recover a
+    # radio that is too hung to connect to, so it must not depend on any
+    # transport starting successfully.
+    if args.meshcore_reset:
+        LOGGER.info("Starting wx-alert mode=radio-reset port=%s", args.meshcore_port)
+        try:
+            hard_reset(args.meshcore_port, settle=args.meshcore_config.reset_settle)
+        except RadioResetError as exc:
+            LOGGER.error("Radio reset failed error=%s", exc)
+            return STATUS_DELIVERY_FAILURE
+        LOGGER.info("Radio reset issued; reconnect with --meshcore-test to verify")
+        return 0
 
     self_test = args.ntfy_test or args.meshcore_test
     mode = "self-test" if self_test else ("polling" if args.loop else "once")
