@@ -9,9 +9,11 @@ import time
 
 import requests
 
-from .app import STATUS_DELIVERY_FAILURE, run_polling_loop
+from .app import STATUS_DELIVERY_FAILURE, STATUS_STATE_FAILURE, run_polling_loop
 from .cli import parse_arguments
+from .policy import StartupPolicy
 from .shutdown import install_signal_handlers
+from .state import StateError, load_state
 from .transports.base import Transport, TransportError
 from .transports.ntfy import NtfyTransport
 
@@ -47,6 +49,10 @@ def build_transports(
                 tags=args.ntfy_tags,
                 priority=args.ntfy_priority,
                 verbose=args.verbose,
+                startup_policy=StartupPolicy(
+                    max_age_seconds=args.startup_max_age,
+                    always_notify_warnings=args.notify_old_warnings_on_startup,
+                ),
             )
         )
 
@@ -81,6 +87,14 @@ def main(argv: list[str] | None = None) -> int:
                     return STATUS_DELIVERY_FAILURE
             return 0
 
+        try:
+            state = load_state(args.state_file)
+        except StateError as exc:
+            # Refuse to start rather than run with no history. Continuing
+            # would re-deliver every currently active alert.
+            LOGGER.error("Persistent state initialization failed error=%s", exc)
+            return STATUS_STATE_FAILURE
+
         started: list[Transport] = []
         try:
             for transport in transports:
@@ -90,10 +104,10 @@ def main(argv: list[str] | None = None) -> int:
             LOGGER.error("Transport startup failed error=%s", exc)
             for transport in started:
                 transport.close()
-            return 3
+            return STATUS_STATE_FAILURE
 
         try:
-            return run_polling_loop(session, args, started)
+            return run_polling_loop(session, args, started, state)
         finally:
             for transport in started:
                 transport.close()

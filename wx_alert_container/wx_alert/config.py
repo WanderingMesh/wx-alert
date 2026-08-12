@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .state import DEFAULT_RETENTION_DAYS, DEFAULT_STATE_FILE
 from .text import clean_optional
 
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
@@ -19,6 +20,8 @@ DEFAULT_NTFY_TAGS = "weather"
 DEFAULT_NTFY_PRIORITY = "auto"
 DEFAULT_DELAY_SECONDS = 1
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600
+DEFAULT_STARTUP_MAX_AGE_SECONDS = 900
+DEFAULT_ALWAYS_NOTIFY_WARNINGS = True
 
 NTFY_PRIORITY_CHOICES = (
     "auto",
@@ -44,8 +47,12 @@ class FileConfiguration:
     ntfy_token: str | None
     ntfy_tags: str
     ntfy_priority: str
+    ntfy_startup_max_age: int
     delay: int
     check_interval: int
+    always_notify_warnings_on_startup: bool
+    state_file: Path
+    state_retention_days: int
 
 
 def validate_delay(value: int, source: str = "delay") -> int:
@@ -59,6 +66,18 @@ def validate_check_interval(value: int, source: str = "check interval") -> int:
         raise ConfigurationError(
             f"{source} must be between 5 and 3600 seconds"
         )
+    return value
+
+
+def validate_nonnegative(value: int, source: str) -> int:
+    if value < 0:
+        raise ConfigurationError(f"{source} must be zero or greater")
+    return value
+
+
+def validate_retention_days(value: int, source: str = "retention days") -> int:
+    if not 1 <= value <= 365:
+        raise ConfigurationError(f"{source} must be between 1 and 365")
     return value
 
 
@@ -121,6 +140,20 @@ def _read_int(
     except ValueError as exc:
         raise ConfigurationError(
             f"[{section}] {option} must be an integer"
+        ) from exc
+
+
+def _read_bool(
+    parser: configparser.ConfigParser,
+    section: str,
+    option: str,
+    fallback: bool,
+) -> bool:
+    try:
+        return parser.getboolean(section, option, fallback=fallback)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"[{section}] {option} must be true or false"
         ) from exc
 
 
@@ -191,6 +224,34 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
         "[delivery] CHECK_INTERVAL",
     )
 
+    startup_max_age = validate_nonnegative(
+        _read_int(
+            parser,
+            "delivery",
+            "STARTUP_MAX_AGE_SECONDS",
+            DEFAULT_STARTUP_MAX_AGE_SECONDS,
+        ),
+        "[delivery] STARTUP_MAX_AGE_SECONDS",
+    )
+    always_notify_warnings = _read_bool(
+        parser,
+        "delivery",
+        "ALWAYS_NOTIFY_WARNINGS_ON_STARTUP",
+        DEFAULT_ALWAYS_NOTIFY_WARNINGS,
+    )
+
+    state_file_raw = parser.get(
+        "state",
+        "STATE_FILE",
+        fallback=str(DEFAULT_STATE_FILE),
+    ).strip()
+    state_file = Path(state_file_raw or DEFAULT_STATE_FILE)
+
+    retention_days = validate_retention_days(
+        _read_int(parser, "state", "RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
+        "[state] RETENTION_DAYS",
+    )
+
     return FileConfiguration(
         latitude=latitude,
         longitude=longitude,
@@ -199,6 +260,10 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
         ntfy_token=token,
         ntfy_tags=tags,
         ntfy_priority=priority,
+        ntfy_startup_max_age=startup_max_age,
         delay=delay,
         check_interval=check_interval,
+        always_notify_warnings_on_startup=always_notify_warnings,
+        state_file=state_file,
+        state_retention_days=retention_days,
     )

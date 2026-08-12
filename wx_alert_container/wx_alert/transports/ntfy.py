@@ -13,8 +13,9 @@ from ..formatting import (
     ntfy_priority_for_alert,
     ntfy_tags_for_alert,
 )
+from ..policy import StartupPolicy, should_suppress_on_startup
 from ..text import clean_field
-from .base import DeliveryResult
+from .base import DeliveryContext, DeliveryResult
 
 LOGGER = logging.getLogger("wx-alert")
 
@@ -81,6 +82,7 @@ class NtfyTransport:
         tags: str,
         priority: str,
         verbose: bool,
+        startup_policy: StartupPolicy,
     ) -> None:
         self._session = session
         self._server = server
@@ -89,6 +91,7 @@ class NtfyTransport:
         self._tags = tags
         self._priority = priority
         self._verbose = verbose
+        self._startup_policy = startup_policy
 
     def start(self) -> None:
         LOGGER.info(
@@ -124,7 +127,20 @@ class NtfyTransport:
         else:
             LOGGER.info("ntfy test successful")
 
-    def deliver(self, alert: dict[str, Any]) -> tuple[DeliveryResult, str]:
+    def deliver(
+        self,
+        alert: dict[str, Any],
+        context: DeliveryContext,
+    ) -> tuple[DeliveryResult, str]:
+        suppress, reason = should_suppress_on_startup(
+            alert,
+            self._startup_policy,
+            context.first_cycle,
+            context.now,
+        )
+        if suppress:
+            return DeliveryResult.SKIPPED, f"startup-stale: {reason}"
+
         event = clean_field(alert.get("event"), "Unknown weather alert")
         headline = clean_field(alert.get("headline"), "No headline provided.")
         priority = ntfy_priority_for_alert(alert, self._priority)

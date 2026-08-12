@@ -8,12 +8,30 @@ should not know any of that, so all of it collapses into three outcomes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 
 class TransportError(RuntimeError):
     """Raised when a transport cannot be initialized from its configuration."""
+
+
+@dataclass(frozen=True)
+class DeliveryContext:
+    """Per-cycle information a transport needs to make policy decisions.
+
+    `now` is passed in rather than read from the clock inside each transport
+    so that staleness and rate-limit behavior can be tested deterministically.
+    """
+
+    first_cycle: bool
+    now: datetime
+
+    @classmethod
+    def create(cls, first_cycle: bool) -> "DeliveryContext":
+        return cls(first_cycle=first_cycle, now=datetime.now(timezone.utc))
 
 
 class DeliveryResult(Enum):
@@ -48,7 +66,11 @@ class Transport(Protocol):
     def selftest(self) -> None:
         """Send one test message. Raises on failure."""
 
-    def deliver(self, alert: dict[str, Any]) -> tuple[DeliveryResult, str]:
+    def deliver(
+        self,
+        alert: dict[str, Any],
+        context: DeliveryContext,
+    ) -> tuple[DeliveryResult, str]:
         """Attempt delivery of one alert.
 
         Returns the outcome and a short human-readable detail suitable for a

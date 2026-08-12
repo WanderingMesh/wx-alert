@@ -20,6 +20,7 @@ from .config import (
     validate_delay,
     validate_latitude,
     validate_longitude,
+    validate_nonnegative,
 )
 from .text import clean_optional
 
@@ -58,6 +59,12 @@ def longitude_value(value: str) -> float:
 
 def ntfy_server_url(value: str) -> str:
     return _argparse_wrapper(lambda v: normalize_server_url(v, "ntfy server"))(value)
+
+
+def nonnegative_seconds(value: str) -> int:
+    return _argparse_wrapper(
+        lambda v: validate_nonnegative(int(v), "value")
+    )(value)
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -197,6 +204,39 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Comma-separated base ntfy tags. Normally supplied by config.ini.",
     )
 
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=config.state_file,
+        metavar="FILE",
+        help=(
+            "Persistent delivery history. Mount this path as a volume so it "
+            f"survives container replacement. Configured default: {config.state_file}"
+        ),
+    )
+
+    parser.add_argument(
+        "--startup-max-age",
+        type=nonnegative_seconds,
+        default=config.ntfy_startup_max_age,
+        metavar="SECONDS",
+        help=(
+            "On the first cycle after start, do not send a non-warning "
+            "product older than this. 0 disables the policy. Configured "
+            f"default: {config.ntfy_startup_max_age}."
+        ),
+    )
+
+    parser.add_argument(
+        "--notify-old-warnings-on-startup",
+        action=argparse.BooleanOptionalAction,
+        default=config.always_notify_warnings_on_startup,
+        help=(
+            "Allow active warnings to bypass the startup age limit. "
+            f"Configured default: {config.always_notify_warnings_on_startup}."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.ntfy and args.ntfy_test:
@@ -213,5 +253,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     args.ntfy_topic = clean_optional(args.ntfy_topic)
     args.ntfy_token = clean_optional(args.ntfy_token)
     args.ntfy_tags = args.ntfy_tags.strip()
+
+    # Not exposed on the command line: changing retention per-run has no
+    # sensible use, and it belongs with the rest of the state settings.
+    args.state_retention_days = config.state_retention_days
 
     return args
