@@ -428,14 +428,19 @@ Whether identical copies of a channel message actually get deduplicated is
 **unresolved**, and the `1/2` marker described under *Repeated transmission*
 is a precaution rather than a proven fix.
 
-One trial: two byte-identical messages and two carrying distinct markers were
-transmitted in the same session, six seconds apart within each pair. Three
-arrived — one of the identical pair, both of the marked pair.
+Two trials so far, both on `#rno-wx-alerts`:
 
-That is suggestive and nothing more. The obvious alternative explanation is an
-ordinary collision, which is exactly the loss the repeat exists to cover, and
-one message out of four had already gone missing during bring-up. A single
-trial cannot separate the two.
+| Trial | Sent | Arrived |
+|---|---|---|
+| Paired A/B test | 2 byte-identical, 2 marked | 1 of the identical, 2 of the marked |
+| `--meshcore-test` self-test | 2 marked | 2 |
+
+So marked copies are 4 for 4, and the only copy ever lost was one of an
+identical pair. That is consistent with deduplication, but it does not
+demonstrate it. An ordinary collision is exactly the loss the repeat exists to
+cover, one message out of four had already gone missing during bring-up, and a
+single missing message is a sample of one however many marked copies arrive
+alongside it.
 
 The mechanisms argue *against* deduplication being the cause, and the obvious
 candidate explanation does not survive a look at the source.
@@ -455,9 +460,10 @@ both. The companion protocol suggests clients key on timestamp and content
 together, which would also pass both. Deduplication would only explain the
 result if some client in the path keys on content alone.
 
-To settle it, repeat the paired test several times and count. If both marked
-copies keep arriving while identical ones arrive about half the time, that is
-loss, not deduplication.
+To settle it, run the paired test enough times to count identical-pair
+arrivals. Identical copies arriving *never* is deduplication; arriving
+sometimes is loss. One trial cannot tell those apart, and the marked copies
+say nothing either way — they are the control.
 
 The marker is worth keeping either way: it costs four bytes, and it tells a
 reader that they are looking at one warning rather than two.
