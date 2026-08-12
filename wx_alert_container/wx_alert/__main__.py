@@ -12,9 +12,11 @@ import requests
 from .app import STATUS_DELIVERY_FAILURE, STATUS_STATE_FAILURE, run_polling_loop
 from .cli import parse_arguments
 from .policy import StartupPolicy
+from .ratelimit import RateLimiter, RelevanceFilter
 from .shutdown import install_signal_handlers
 from .state import StateError, load_state
 from .transports.base import Transport, TransportError
+from .transports.meshcore import MeshCoreTransport
 from .transports.ntfy import NtfyTransport
 
 LOGGER = logging.getLogger("wx-alert")
@@ -56,6 +58,42 @@ def build_transports(
             )
         )
 
+    if args.meshcore or args.meshcore_test:
+        mesh = args.meshcore_config
+
+        try:
+            relevance = RelevanceFilter(
+                minimum_class=mesh.minimum_class,
+                minimum_severity=mesh.minimum_severity,
+            )
+        except ValueError as exc:
+            raise TransportError(f"MeshCore filter is invalid: {exc}") from exc
+
+        transports.append(
+            MeshCoreTransport(
+                port=args.meshcore_port or "",
+                baud=mesh.baud,
+                channel_index=args.meshcore_channel,
+                relevance=relevance,
+                rate_limiter=RateLimiter(
+                    min_interval_seconds=mesh.min_interval_seconds,
+                    max_per_hour=mesh.max_per_hour,
+                ),
+                startup_policy=StartupPolicy(
+                    max_age_seconds=mesh.startup_max_age,
+                    # The warning bypass is deliberately not applied to the
+                    # radio. On ntfy a duplicate costs nothing; on a shared
+                    # channel, replaying hours-old warnings after a restart
+                    # costs everyone airtime.
+                    always_notify_warnings=False,
+                ),
+                connect_timeout=mesh.connect_timeout,
+                send_timeout=mesh.send_timeout,
+                dry_run=args.meshcore_dry_run,
+                debug=args.verbose,
+            )
+        )
+
     return transports
 
 
@@ -64,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
     install_signal_handlers()
 
-    mode = "ntfy-test" if args.ntfy_test else ("polling" if args.loop else "once")
+    self_test = args.ntfy_test or args.meshcore_test
+    mode = "self-test" if self_test else ("polling" if args.loop else "once")
     LOGGER.info("Starting wx-alert mode=%s config=%s", mode, args.config)
 
     with requests.Session() as session:
@@ -72,9 +111,10 @@ def main(argv: list[str] | None = None) -> int:
             transports = build_transports(session, args)
         except TransportError as exc:
             LOGGER.error("Transport initialization failed error=%s", exc)
-            return 3
+            return STATUS_STATE_FAILURE
 
-        if args.ntfy_test:
+        if self_test:
+            status = 0
             for transport in transports:
                 try:
                     transport.selftest()
@@ -84,8 +124,10 @@ def main(argv: list[str] | None = None) -> int:
                         transport.name,
                         exc,
                     )
-                    return STATUS_DELIVERY_FAILURE
-            return 0
+                    status = STATUS_DELIVERY_FAILURE
+                finally:
+                    transport.close()
+            return status
 
         try:
             state = load_state(args.state_file)

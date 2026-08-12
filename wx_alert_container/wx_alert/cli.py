@@ -8,6 +8,7 @@ know about the other.
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 from .config import (
@@ -23,6 +24,8 @@ from .config import (
     validate_nonnegative,
 )
 from .text import clean_optional
+
+LOGGER = logging.getLogger("wx-alert")
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.ini"
 
@@ -237,6 +240,62 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    mesh = parser.add_argument_group(
+        "MeshCore",
+        "Broadcast to a MeshCore channel via a USB companion radio.",
+    )
+
+    mesh.add_argument(
+        "--meshcore",
+        action=argparse.BooleanOptionalAction,
+        default=config.meshcore.enabled,
+        help=(
+            "Broadcast qualifying alerts to a MeshCore channel. "
+            f"Configured default: {config.meshcore.enabled}."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-test",
+        action="store_true",
+        help=(
+            "Connect to the radio, report what it says, transmit one test "
+            "message, and exit without querying NWS."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-dry-run",
+        action="store_true",
+        help=(
+            "Render and log every message that would be transmitted, "
+            "including its byte size, without opening the serial port. "
+            "Use this to review formatting before going on the air."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-port",
+        default=config.meshcore.port,
+        metavar="DEVICE",
+        help=(
+            "Serial device for the companion radio. Prefer a stable "
+            "/dev/serial/by-id/ path over /dev/ttyACM0, which can change "
+            f"across reboots. Configured default: {config.meshcore.port}"
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-channel",
+        type=int,
+        default=config.meshcore.channel_index,
+        metavar="INDEX",
+        help=(
+            "Channel index to broadcast on. Configured default: "
+            f"{config.meshcore.channel_index}."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.ntfy and args.ntfy_test:
@@ -248,6 +307,27 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "when using --ntfy or --ntfy-test"
         )
 
+    args.meshcore_port = clean_optional(args.meshcore_port)
+    meshcore_wanted = args.meshcore or args.meshcore_test
+
+    # A dry run renders messages without touching hardware, so it is the one
+    # way to exercise the transport with no port configured.
+    if meshcore_wanted and not args.meshcore_port and not args.meshcore_dry_run:
+        parser.error(
+            "[meshcore] PORT in the config file, or --meshcore-port, is "
+            "required when MeshCore is enabled"
+        )
+
+    if args.meshcore_test and args.ntfy_test:
+        parser.error("--meshcore-test and --ntfy-test cannot be used together")
+
+    # Catching this here means an operator who mistypes a flag gets an error
+    # rather than a container that polls NWS forever and delivers nothing.
+    if not (args.ntfy or args.ntfy_test or meshcore_wanted or args.verbose):
+        LOGGER.warning(
+            "No transport is enabled; alerts will only be printed to stdout"
+        )
+
     args.config = config_args.config
     args.config_parser = parsed_file
     args.ntfy_topic = clean_optional(args.ntfy_topic)
@@ -257,5 +337,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     # Not exposed on the command line: changing retention per-run has no
     # sensible use, and it belongs with the rest of the state settings.
     args.state_retention_days = config.state_retention_days
+
+    # Carried through so the transport can be built without re-reading the
+    # file. Only the settings with a real per-run use get their own flag.
+    args.meshcore_config = config.meshcore
 
     return args

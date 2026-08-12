@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .nws import EVENT_CLASS_RANK, SEVERITY_RANK
 from .state import DEFAULT_RETENTION_DAYS, DEFAULT_STATE_FILE
 from .text import clean_optional
 
@@ -22,6 +23,19 @@ DEFAULT_DELAY_SECONDS = 1
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600
 DEFAULT_STARTUP_MAX_AGE_SECONDS = 900
 DEFAULT_ALWAYS_NOTIFY_WARNINGS = True
+
+# MeshCore defaults are deliberately conservative. Airtime on a shared LoRa
+# channel is a common resource, so the out-of-box behavior carries only
+# products that are actually happening, at a modest rate.
+DEFAULT_MESHCORE_BAUD = 115200
+DEFAULT_MESHCORE_CHANNEL = 0
+DEFAULT_MESHCORE_MIN_CLASS = "warning"
+DEFAULT_MESHCORE_MIN_SEVERITY = "severe"
+DEFAULT_MESHCORE_MIN_INTERVAL = 30
+DEFAULT_MESHCORE_MAX_PER_HOUR = 12
+DEFAULT_MESHCORE_STARTUP_MAX_AGE = 900
+DEFAULT_MESHCORE_SEND_TIMEOUT = 30
+DEFAULT_MESHCORE_CONNECT_TIMEOUT = 30
 
 NTFY_PRIORITY_CHOICES = (
     "auto",
@@ -39,6 +53,23 @@ class ConfigurationError(ValueError):
 
 
 @dataclass(frozen=True)
+class MeshCoreConfiguration:
+    """Settings for the MeshCore radio transport."""
+
+    enabled: bool
+    port: str | None
+    baud: int
+    channel_index: int
+    minimum_class: str
+    minimum_severity: str
+    min_interval_seconds: int
+    max_per_hour: int
+    startup_max_age: int
+    connect_timeout: int
+    send_timeout: int
+
+
+@dataclass(frozen=True)
 class FileConfiguration:
     latitude: float
     longitude: float
@@ -53,6 +84,7 @@ class FileConfiguration:
     always_notify_warnings_on_startup: bool
     state_file: Path
     state_retention_days: int
+    meshcore: MeshCoreConfiguration
 
 
 def validate_delay(value: int, source: str = "delay") -> int:
@@ -104,6 +136,112 @@ def normalize_server_url(value: str, source: str = "server") -> str:
         )
 
     return value
+
+
+def load_meshcore_configuration(
+    parser: configparser.ConfigParser,
+) -> MeshCoreConfiguration:
+    """Read the optional [meshcore] section.
+
+    The section may be absent entirely, in which case the transport is simply
+    disabled. When it is present and enabled, every setting is validated, so
+    a typo cannot silently degrade into broadcasting the wrong products onto
+    a shared channel.
+    """
+    enabled = _read_bool(parser, "meshcore", "ENABLED", False)
+    port = clean_optional(parser.get("meshcore", "PORT", fallback=""))
+
+    minimum_class = (
+        parser.get("meshcore", "MIN_CLASS", fallback=DEFAULT_MESHCORE_MIN_CLASS)
+        .strip()
+        .lower()
+        or DEFAULT_MESHCORE_MIN_CLASS
+    )
+    if minimum_class not in EVENT_CLASS_RANK:
+        choices = ", ".join(sorted(EVENT_CLASS_RANK))
+        raise ConfigurationError(f"[meshcore] MIN_CLASS must be one of: {choices}")
+
+    minimum_severity = (
+        parser.get(
+            "meshcore",
+            "MIN_SEVERITY",
+            fallback=DEFAULT_MESHCORE_MIN_SEVERITY,
+        )
+        .strip()
+        .lower()
+        or DEFAULT_MESHCORE_MIN_SEVERITY
+    )
+    if minimum_severity not in SEVERITY_RANK:
+        choices = ", ".join(sorted(SEVERITY_RANK))
+        raise ConfigurationError(
+            f"[meshcore] MIN_SEVERITY must be one of: {choices}"
+        )
+
+    channel_index = _read_int(
+        parser, "meshcore", "CHANNEL_INDEX", DEFAULT_MESHCORE_CHANNEL
+    )
+    if not 0 <= channel_index <= 255:
+        raise ConfigurationError(
+            "[meshcore] CHANNEL_INDEX must be between 0 and 255"
+        )
+
+    baud = _read_int(parser, "meshcore", "BAUD", DEFAULT_MESHCORE_BAUD)
+    if baud <= 0:
+        raise ConfigurationError("[meshcore] BAUD must be a positive integer")
+
+    return MeshCoreConfiguration(
+        enabled=enabled,
+        port=port,
+        baud=baud,
+        channel_index=channel_index,
+        minimum_class=minimum_class,
+        minimum_severity=minimum_severity,
+        min_interval_seconds=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "MIN_SECONDS_BETWEEN_SENDS",
+                DEFAULT_MESHCORE_MIN_INTERVAL,
+            ),
+            "[meshcore] MIN_SECONDS_BETWEEN_SENDS",
+        ),
+        max_per_hour=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "MAX_SENDS_PER_HOUR",
+                DEFAULT_MESHCORE_MAX_PER_HOUR,
+            ),
+            "[meshcore] MAX_SENDS_PER_HOUR",
+        ),
+        startup_max_age=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "STARTUP_MAX_AGE_SECONDS",
+                DEFAULT_MESHCORE_STARTUP_MAX_AGE,
+            ),
+            "[meshcore] STARTUP_MAX_AGE_SECONDS",
+        ),
+        connect_timeout=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "CONNECT_TIMEOUT",
+                DEFAULT_MESHCORE_CONNECT_TIMEOUT,
+            ),
+            "[meshcore] CONNECT_TIMEOUT",
+        ),
+        send_timeout=validate_nonnegative(
+            _read_int(
+                parser,
+                "meshcore",
+                "SEND_TIMEOUT",
+                DEFAULT_MESHCORE_SEND_TIMEOUT,
+            ),
+            "[meshcore] SEND_TIMEOUT",
+        ),
+    )
 
 
 def _require_section(parser: configparser.ConfigParser, section: str) -> None:
@@ -266,4 +404,5 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
         always_notify_warnings_on_startup=always_notify_warnings,
         state_file=state_file,
         state_retention_days=retention_days,
+        meshcore=load_meshcore_configuration(parser),
     )
