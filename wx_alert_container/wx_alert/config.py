@@ -23,6 +23,7 @@ DEFAULT_DELAY_SECONDS = 1
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600
 DEFAULT_STARTUP_MAX_AGE_SECONDS = 900
 DEFAULT_ALWAYS_NOTIFY_WARNINGS = True
+DEFAULT_EXIT_AFTER_FAILED_CYCLES = 10
 
 # MeshCore defaults are deliberately conservative. Airtime on a shared LoRa
 # channel is a common resource, so the out-of-box behavior carries only
@@ -82,6 +83,7 @@ class FileConfiguration:
     delay: int
     check_interval: int
     always_notify_warnings_on_startup: bool
+    exit_after_failed_cycles: int
     state_file: Path
     state_retention_days: int
     meshcore: MeshCoreConfiguration
@@ -378,6 +380,16 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
         DEFAULT_ALWAYS_NOTIFY_WARNINGS,
     )
 
+    exit_after_failed_cycles = validate_nonnegative(
+        _read_int(
+            parser,
+            "delivery",
+            "EXIT_AFTER_FAILED_CYCLES",
+            DEFAULT_EXIT_AFTER_FAILED_CYCLES,
+        ),
+        "[delivery] EXIT_AFTER_FAILED_CYCLES",
+    )
+
     state_file_raw = parser.get(
         "state",
         "STATE_FILE",
@@ -402,6 +414,7 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
         delay=delay,
         check_interval=check_interval,
         always_notify_warnings_on_startup=always_notify_warnings,
+        exit_after_failed_cycles=exit_after_failed_cycles,
         state_file=state_file,
         state_retention_days=retention_days,
         meshcore=load_meshcore_configuration(parser),

@@ -219,6 +219,19 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--exit-after-failed-cycles",
+        type=nonnegative_seconds,
+        default=config.exit_after_failed_cycles,
+        metavar="COUNT",
+        help=(
+            "Exit non-zero once a transport has failed this many consecutive "
+            "cycles, so the container restart policy can reinitialize it. "
+            "This is how a replugged USB radio is recovered. 0 disables it. "
+            f"Configured default: {config.exit_after_failed_cycles}."
+        ),
+    )
+
+    parser.add_argument(
         "--startup-max-age",
         type=nonnegative_seconds,
         default=config.ntfy_startup_max_age,

@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import requests
 
 from .formatting import build_compact_stdout_message, build_verbose_message
+from .health import heartbeat_path, write_heartbeat
 from .nws import (
     alert_age_seconds,
     alert_class,
@@ -28,6 +29,7 @@ STATUS_OK = 0
 STATUS_SOURCE_FAILURE = 1
 STATUS_DELIVERY_FAILURE = 2
 STATUS_STATE_FAILURE = 3
+STATUS_TRANSPORT_UNHEALTHY = 4
 
 # With no transport enabled the program is a console viewer. Alert processing
 # still needs a name to record against, or polling would reprint the same
@@ -84,6 +86,7 @@ def deliver_alert(
     transports: Sequence[Transport],
     state: AlertState,
     context: DeliveryContext,
+    failed_transports: set[str] | None = None,
 ) -> int:
     """Offer one alert to every transport that has not already handled it.
 
@@ -112,6 +115,8 @@ def deliver_alert(
         except Exception as exc:  # noqa: BLE001 - a transport bug must not
             # take down the poller; the alert simply stays eligible for retry.
             failures += 1
+            if failed_transports is not None:
+                failed_transports.add(transport.name)
             LOGGER.exception(
                 "Transport raised unexpectedly transport=%s event=%r error=%s",
                 transport.name,
@@ -140,6 +145,8 @@ def deliver_alert(
             state.record(alert, transport.name, f"skipped:{detail}")
         else:
             failures += 1
+            if failed_transports is not None:
+                failed_transports.add(transport.name)
             LOGGER.error(
                 "Delivery failed transport=%s event=%r error=%s",
                 transport.name,
@@ -156,6 +163,7 @@ def process_alerts(
     state: AlertState,
     args: argparse.Namespace,
     context: DeliveryContext,
+    failed_transports: set[str] | None = None,
 ) -> int:
     """Print and deliver every new alert as a separate record."""
     failures = 0
@@ -182,7 +190,13 @@ def process_alerts(
             format_age(alert_age_seconds(alert, context.now)),
         )
 
-        failures += deliver_alert(alert, transports, state, context)
+        failures += deliver_alert(
+            alert,
+            transports,
+            state,
+            context,
+            failed_transports,
+        )
 
         # Persist after each alert rather than at the end of the cycle. A
         # crash between two deliveries would otherwise replay the ones
@@ -217,6 +231,7 @@ def perform_alert_check(
     state: AlertState,
     *,
     first_cycle: bool,
+    failed_transports: set[str] | None = None,
 ) -> int:
     """Perform one NWS query and deliver whatever is outstanding."""
     alerts = fetch_alerts(session, args.latitude, args.longitude)
@@ -255,7 +270,14 @@ def perform_alert_check(
         LOGGER.info("Nothing outstanding; no notification sent")
         return STATUS_OK
 
-    delivery_failures = process_alerts(outstanding, transports, state, args, context)
+    delivery_failures = process_alerts(
+        outstanding,
+        transports,
+        state,
+        args,
+        context,
+        failed_transports,
+    )
 
     if delivery_failures:
         LOGGER.error(
@@ -291,10 +313,14 @@ def run_polling_loop(
         args.state_file,
     )
     check_number = 0
+    heartbeat = heartbeat_path(args.state_file)
+    consecutive_failures: dict[str, int] = {}
 
     while not STOP_EVENT.is_set():
         check_number += 1
         LOGGER.info("Beginning check cycle=%d", check_number)
+
+        failed_transports: set[str] = set()
 
         try:
             status = perform_alert_check(
@@ -303,10 +329,26 @@ def run_polling_loop(
                 transports,
                 state,
                 first_cycle=(check_number == 1),
+                failed_transports=failed_transports,
             )
         except StateError as exc:
             LOGGER.error("Persistent state operation failed error=%s", exc)
             status = STATUS_STATE_FAILURE
+
+        for transport in transports:
+            if transport.name in failed_transports:
+                consecutive_failures[transport.name] = (
+                    consecutive_failures.get(transport.name, 0) + 1
+                )
+            else:
+                consecutive_failures[transport.name] = 0
+
+        write_heartbeat(
+            heartbeat,
+            check_interval=args.check_interval,
+            cycle=check_number,
+            consecutive_failures=consecutive_failures,
+        )
 
         if status != STATUS_OK:
             LOGGER.warning(
@@ -314,6 +356,24 @@ def run_polling_loop(
                 check_number,
                 status,
             )
+
+        # Exit rather than spin forever on a transport that will not recover
+        # in place. The motivating case is a USB radio unplugged and plugged
+        # back in: the container still holds the original device node, which
+        # no longer exists, and no amount of reconnecting inside this process
+        # will fix it. Exiting lets the restart policy recreate the container
+        # against the current device.
+        if args.exit_after_failed_cycles > 0:
+            for name, count in consecutive_failures.items():
+                if count >= args.exit_after_failed_cycles:
+                    LOGGER.error(
+                        "Transport %s has failed %d consecutive cycle(s); "
+                        "exiting so the container restart policy can "
+                        "reinitialize it",
+                        name,
+                        count,
+                    )
+                    return STATUS_TRANSPORT_UNHEALTHY
 
         if STOP_EVENT.is_set():
             break
