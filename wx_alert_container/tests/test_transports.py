@@ -414,14 +414,59 @@ class TestMeshCoreRepeats:
         assert "copies=2" in detail
         assert len(radio.sent) == 2
 
-    def test_every_copy_is_identical(
+    def test_no_two_copies_are_identical(
         self, make_transport, radio, fresh_warning, now, no_repeat_delay
     ):
+        # A receiver that deduplicates on message content would collapse
+        # identical copies back into one, spending double the airtime to
+        # deliver a single message. Distinct copies cannot be collapsed.
         transport = make_transport(repeat_sends=3)
         transport.start()
         transport.deliver(fresh_warning, DeliveryContext(False, now))
 
-        assert len({message for _channel, message in radio.sent}) == 1
+        messages = [message for _channel, message in radio.sent]
+        assert len(messages) == 3
+        assert len(set(messages)) == 3
+
+    def test_copies_are_labelled_in_order(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        transport = make_transport(repeat_sends=2)
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        messages = [message for _channel, message in radio.sent]
+        assert messages[0].endswith(" 1/2")
+        assert messages[1].endswith(" 2/2")
+
+    def test_a_single_copy_carries_no_label(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        # Nothing to disambiguate, so the marker would be pure noise and would
+        # cost bytes that the message body needs.
+        transport = make_transport(repeat_sends=1)
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert not radio.sent[0][1].rstrip().endswith("1/1")
+
+    def test_the_label_fits_inside_the_budget(
+        self, make_transport, radio, now, no_repeat_delay, fresh_warning
+    ):
+        # A message rendered to the full budget would overflow the firmware's
+        # limit once the marker was appended, so the budget has to be reserved
+        # up front rather than trimmed afterwards.
+        verbose = dict(
+            fresh_warning,
+            areaDesc="; ".join(f"Very Long County Name Number {n}" for n in range(12)),
+            instruction="Take shelter immediately. " * 12,
+        )
+        transport = make_transport(repeat_sends=2)
+        transport.start()
+        transport.deliver(verbose, DeliveryContext(False, now))
+
+        for _channel, message in radio.sent:
+            assert len(message.encode("utf-8")) <= transport._budget
 
     def test_repeating_consumes_only_one_unit_of_airtime_budget(
         self, make_transport, radio, fresh_warning, now, no_repeat_delay

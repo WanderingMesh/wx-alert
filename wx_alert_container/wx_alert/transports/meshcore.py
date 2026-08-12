@@ -298,7 +298,7 @@ class MeshCoreTransport:
         LOGGER.info(
             "MeshCore test transmitted channel=%d bytes=%d copies=%d",
             self._channel_index,
-            len(text.encode("utf-8")),
+            len(text.encode("utf-8")) + self._copy_label_reserve(),
             copies,
         )
 
@@ -328,8 +328,11 @@ class MeshCoreTransport:
         if not allowed:
             return DeliveryResult.SKIPPED, f"rate-limit: {reason}"
 
-        text = build_mesh_message(alert, self._budget, context.now)
-        size = len(text.encode("utf-8"))
+        # The copy marker is appended to each transmission, so the rendered
+        # message has to leave room for it.
+        reserve = self._copy_label_reserve()
+        text = build_mesh_message(alert, max(1, self._budget - reserve), context.now)
+        size = len(text.encode("utf-8")) + reserve
 
         if self._dry_run:
             LOGGER.info(
@@ -382,6 +385,41 @@ class MeshCoreTransport:
 
     # -- internals --------------------------------------------------------
 
+    def _copy_label(self, index: int) -> str:
+        """The marker distinguishing one copy of a message from another.
+
+        Mainly this is for the reader: seeing the same warning twice, they have
+        no way to tell whether two separate things happened, and "1/2" answers
+        that.
+
+        It also guards against deduplication on the receiving side. The
+        companion protocol tells client authors to discard duplicate incoming
+        messages and suggests timestamp plus content as the key, but what any
+        given client keys on is up to that client, and one keying on content
+        alone would swallow every repeat. Distinct copies are immune to that
+        without needing to know what is at the other end.
+
+        Whether that actually happens here is unresolved; see "Repeats and
+        deduplication" under Open questions in the readme. The marker is cheap
+        enough to be worth keeping regardless.
+        """
+        if self._repeat_sends < 2:
+            return ""
+        return f" {index}/{self._repeat_sends}"
+
+    def _copy_label_reserve(self) -> int:
+        """Bytes to hold back from the message budget for the copy marker.
+
+        Appending the marker to a message already rendered to the full budget
+        would push it over the firmware's limit.
+        """
+        if self._repeat_sends < 2:
+            return 0
+        return max(
+            len(self._copy_label(index).encode("utf-8"))
+            for index in range(1, self._repeat_sends + 1)
+        )
+
     def _repeat_delay(self) -> float:
         """Pick the gap before the next copy.
 
@@ -402,14 +440,11 @@ class MeshCoreTransport:
         cannot be detected, let alone retried on demand. Sending a second copy
         is the only available defence, and it costs receivers a duplicate.
 
-        The repeat works only because the gap is at least a second. The
-        firmware stamps each message with the current epoch second, and
-        repeaters suppress flood packets they have already forwarded by hash.
-        Two copies sent within the same second would hash identically and the
-        mesh itself would discard the second one, making the whole exercise
-        pointless.
+        Each copy carries a distinct "n/N" marker, so that a receiver
+        deduplicating on message content cannot collapse the copies back into
+        one and quietly undo the whole exercise.
         """
-        self._transmit(text)
+        self._transmit(text + self._copy_label(1))
         copies = 1
 
         while copies < self._repeat_sends:
@@ -421,7 +456,7 @@ class MeshCoreTransport:
                 break
 
             try:
-                self._transmit(text)
+                self._transmit(text + self._copy_label(copies + 1))
             except Exception as exc:  # noqa: BLE001 - any failure here is
                 # survivable, so it is logged rather than raised.
                 #

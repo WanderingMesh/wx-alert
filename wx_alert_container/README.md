@@ -261,6 +261,35 @@ everyone on the channel sees each alert twice, and airtime doubles.
 `MAX_SENDS_PER_HOUR` counts *alerts*, not transmissions, so the default of 12
 alerts per hour is up to 24 transmissions. Set `REPEAT_SENDS = 1` to disable.
 
+Each copy ends with a `1/2`, `2/2` marker, for two reasons.
+
+The first is plain legibility. A reader seeing the same warning twice has no
+way to tell whether two separate things happened; the marker answers that
+without them having to think about it.
+
+The second is defensive, against deduplication. MeshCore deduplicates at two
+levels, and neither is a reason to expect identical copies to survive:
+
+- **Mesh layer.** `MeshTables::hasSeen()` keeps a cyclic table of SHA-256
+  hashes over the payload, and repeaters use it to stop flood packets looping.
+  This one should *not* affect repeats: a channel message encrypts the sender
+  timestamp inside the payload, and copies at least a second apart therefore
+  hash differently.
+- **Client layer.** The companion protocol documentation tells client authors
+  to deduplicate incoming messages, suggesting timestamp and content as the
+  key. What a given client actually keys on is up to that client, and a client
+  keying on content alone would silently swallow every repeat.
+
+The marker makes the repeat robust against the second case without needing to
+know which client anyone is running. See *Repeats and deduplication* under
+**Open questions** for what has and has not been measured here.
+
+The marker costs four bytes, and they are reserved from the message budget
+before the text is rendered rather than trimmed afterwards, so a full-length
+alert cannot overflow the firmware's limit once the marker is appended. With
+`REPEAT_SENDS = 1` there is nothing to disambiguate, so no marker is added and
+the full budget goes to the alert.
+
 The gap between copies is randomised between `REPEAT_MIN_DELAY` and
 `REPEAT_MAX_DELAY` rather than fixed. A constant gap can phase-lock with
 another periodic sender, so two transmissions that collide once would collide
@@ -268,9 +297,9 @@ again on every repeat; jitter decorrelates them.
 
 `REPEAT_MIN_DELAY` may not be less than one second, and startup fails if it
 is. The firmware stamps each message with the current epoch second, and
-repeaters discard flood packets whose hash they have already forwarded. Two
-copies sent inside the same second are byte-identical, so the mesh would drop
-the repeat and the setting would silently accomplish nothing.
+repeaters discard flood packets whose hash they have already forwarded. A
+sub-second gap risks two copies sharing a timestamp, which the mesh would drop
+before the differing markers could save them.
 
 A repeat that fails is logged but does not fail the delivery. The alert
 already went out once, and reporting failure would requeue it and retransmit
@@ -351,17 +380,24 @@ physically power-cycles it.
 
 ### If the radio hangs every time it transmits, check transmit power first
 
-On the radio this was developed against, the hang was caused by running the
-transmitter at its maximum rated power. At `tx_power = 22`, the maximum the
-board reports, a single channel message hung the firmware every time: the send
-returned `OK`, and seconds later the radio stopped answering even a battery
-query on the still-open connection. Dropping to **20** eliminated it — four
-consecutive transmissions with no fault, where 22 had failed on the first.
+**Tentatively specific to the Heltec WiFi LoRa 32 V3.** This was seen on one
+board and has not been reproduced anywhere else, so treat it as a property of
+that hardware — possibly of that individual unit — rather than of MeshCore or
+of this program. If you hit it on something else, the note below is wrong and
+worth correcting.
+
+The hang was caused by running the transmitter at its maximum rated power. At
+`tx_power = 22`, the maximum the board reports, a single channel message hung
+the firmware every time: the send returned `OK`, and seconds later the radio
+stopped answering even a battery query on the still-open connection. Dropping
+to **20** eliminated it — four consecutive transmissions with no fault, where
+22 had failed on the first. 20 dBm has been the operating setting since, with
+no recurrence.
 
 Two decibels is a small change on the air and a large one for the power
-amplifier, which draws its peak current at full output. A charged LiPo on the
-board did not prevent it, so do not rule this out just because the radio has a
-battery.
+amplifier, which draws its peak current at full output. The board was powered
+over USB with a charged LiPo attached, and that did not prevent it, so do not
+rule this out just because the radio has a battery.
 
 The symptom is distinctive, and it looks nothing like a power problem:
 
@@ -377,6 +413,54 @@ this program, the serial library, or the cable:
 ```python
 await mc.commands.set_tx_power(20)   # persists across reboots
 ```
+
+---
+
+## Open questions
+
+Things believed but not established. Recorded here so nobody mistakes them for
+findings, and so anyone with the hardware to settle one knows it is worth
+doing.
+
+### Repeats and deduplication
+
+Whether identical copies of a channel message actually get deduplicated is
+**unresolved**, and the `1/2` marker described under *Repeated transmission*
+is a precaution rather than a proven fix.
+
+One trial: two byte-identical messages and two carrying distinct markers were
+transmitted in the same session, six seconds apart within each pair. Three
+arrived — one of the identical pair, both of the marked pair.
+
+That is suggestive and nothing more. The obvious alternative explanation is an
+ordinary collision, which is exactly the loss the repeat exists to cover, and
+one message out of four had already gone missing during bring-up. A single
+trial cannot separate the two.
+
+The mechanisms argue *against* deduplication being the cause, and the obvious
+candidate explanation does not survive a look at the source.
+
+That candidate is a coarse clock: if the timestamp inside the hash were
+rounded to, say, the minute, copies seconds apart would hash identically and
+the mesh would drop the repeat as a designed behaviour. It is not rounded.
+`BaseChatMesh::sendGroupMessage()` copies the full 32-bit seconds value into
+the payload with `memcpy(temp, &timestamp, 4)`, commented *"mostly an extra
+blob to help make packet_hash unique"* — making the hash differ is the whole
+point of it being there. The value comes from the host, which stamps
+`int(time.time())` per send, and the companion protocol carries it as
+seconds. Nothing in that path quantises.
+
+So copies a second or more apart hash differently and repeaters should forward
+both. The companion protocol suggests clients key on timestamp and content
+together, which would also pass both. Deduplication would only explain the
+result if some client in the path keys on content alone.
+
+To settle it, repeat the paired test several times and count. If both marked
+copies keep arriving while identical ones arrive about half the time, that is
+loss, not deduplication.
+
+The marker is worth keeping either way: it costs four bytes, and it tells a
+reader that they are looking at one warning rather than two.
 
 ---
 

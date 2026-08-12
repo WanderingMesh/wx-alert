@@ -27,7 +27,6 @@ import unicodedata
 from datetime import datetime
 from typing import Any
 
-from .nws import parse_nws_datetime
 from .text import clean_field, clean_optional
 
 # Firmware limits. See src/helpers/BaseChatMesh.h in the MeshCore firmware.
