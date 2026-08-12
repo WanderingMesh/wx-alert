@@ -18,7 +18,8 @@ ENV PATH="/app/venv/bin:$PATH" \
 WORKDIR /app
 
 COPY --from=build /app/venv /app/venv
-COPY get_alerts_ntfy.py config.ini /app/
+COPY wx_alert /app/wx_alert
+COPY config.ini /app/config.ini
 
-ENTRYPOINT ["python", "/app/get_alerts_ntfy.py", "--config", "/app/config.ini"]
+ENTRYPOINT ["python", "-m", "wx_alert", "--config", "/app/config.ini"]
 CMD ["--ntfy", "--loop"]
