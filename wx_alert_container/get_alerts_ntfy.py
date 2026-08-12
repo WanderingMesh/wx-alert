@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
+import json
 import logging
 import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -19,7 +22,7 @@ import requests
 NWS_API_URL = "https://api.weather.gov/alerts/active"
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.ini")
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
-DEFAULT_NTFY_TAGS = "warning,weather"
+DEFAULT_NTFY_TAGS = "weather"
 DEFAULT_NTFY_PRIORITY = "auto"
 DEFAULT_DELAY_SECONDS = 1
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600
@@ -39,6 +42,11 @@ NTFY_PRIORITY_CHOICES = (
     "max",
     "urgent",
 )
+
+# Product-class tags that this program derives from the event name itself.
+# Any of these appearing in configured tags is stale and gets replaced, so a
+# Flood Watch is never labelled as a warning.
+EVENT_CLASS_TAGS = {"warning", "watch", "advisory", "statement", "outlook", "other"}
 
 LOGGER = logging.getLogger("wx-alert")
 STOP_EVENT = threading.Event()
@@ -465,6 +473,102 @@ def clean_field(value: Any, fallback: str) -> str:
     return text if text else fallback
 
 
+def parse_nws_datetime(value: Any) -> datetime | None:
+    """Parse an NWS ISO-8601 timestamp into an aware UTC datetime.
+
+    NWS emits offsets like "-07:00" which fromisoformat handles, but a
+    trailing "Z" appears in some fields and older Python builds reject it.
+    Anything unparseable returns None rather than raising, because a missing
+    timestamp must never take down a delivery cycle.
+    """
+    text = clean_optional(str(value)) if value is not None else None
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def alert_sent_time(alert: dict[str, Any]) -> datetime | None:
+    """Return when NWS issued this alert.
+
+    "sent" is the true issue time. "effective" and "onset" are fallbacks for
+    products that omit it, ordered from most to least reliable.
+    """
+    for field in ("sent", "effective", "onset"):
+        parsed = parse_nws_datetime(alert.get(field))
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def alert_age_seconds(
+    alert: dict[str, Any],
+    now: datetime | None = None,
+) -> int | None:
+    """Return the age of an alert in seconds, or None if the issue time is unknown."""
+    sent = alert_sent_time(alert)
+    if sent is None:
+        return None
+
+    current = now or datetime.now(timezone.utc)
+
+    # Clamp negatives: an alert with a future effective time is not "negative
+    # age", it is simply brand new.
+    return max(0, int((current - sent).total_seconds()))
+
+
+def format_age(seconds: int | None) -> str:
+    """Render an age in compact human-readable form for log lines."""
+    if seconds is None:
+        return "unknown"
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+
+    return f"{secs}s"
+
+
+def classify_event(event: str) -> str:
+    """Classify an NWS product by name into its urgency class.
+
+    CAP severity alone is not enough to decide how loudly to announce a
+    product: a Flood Watch and a Flash Flood Warning can both carry
+    severity=Severe while demanding very different responses. The product
+    name is what actually distinguishes them.
+
+    Order matters. "Emergency" outranks everything, and several product names
+    contain more than one keyword.
+    """
+    value = event.casefold()
+
+    if "emergency" in value or "warning" in value:
+        return "warning"
+    if "watch" in value:
+        return "watch"
+    if "advisory" in value:
+        return "advisory"
+    if "statement" in value:
+        return "statement"
+    if "outlook" in value:
+        return "outlook"
+
+    return "other"
+
+
 def build_compact_stdout_message(alert: dict[str, Any]) -> str:
     """Build the two-line compact record: event followed by headline."""
     event = clean_field(alert.get("event"), "Unknown weather alert")
@@ -523,19 +627,62 @@ def ntfy_priority_for_alert(
     alert: dict[str, Any],
     configured_priority: str,
 ) -> str:
-    """Map NWS severity to ntfy priority when configured as auto."""
-    if configured_priority != "auto":
-        return configured_priority
+    """Choose an ntfy priority using product class first, then CAP severity.
 
+    Mapping severity alone over-promotes watches: NWS routinely issues a Flood
+    Watch with severity=Severe, which a naive severity map turns into the same
+    priority as an active Flash Flood Warning. Classifying the product first
+    and using severity only to break ties within a class keeps the loudest
+    priorities reserved for events that are actually happening.
+    """
+    if configured_priority != "auto":
+        # "urgent" is an ntfy alias for max; normalize so downstream code and
+        # logs only ever see the canonical name.
+        return "max" if configured_priority == "urgent" else configured_priority
+
+    event = clean_field(alert.get("event"), "Unknown weather alert")
+    event_class = classify_event(event)
     severity = clean_field(alert.get("severity"), "Unknown").casefold()
-    priority_map = {
-        "extreme": "urgent",
-        "severe": "high",
-        "moderate": "default",
-        "minor": "low",
-        "unknown": "default",
-    }
-    return priority_map.get(severity, "default")
+
+    if "emergency" in event.casefold():
+        return "max"
+    if event_class == "warning":
+        return "max" if severity in {"extreme", "severe"} else "high"
+    if event_class == "watch":
+        return "high" if severity in {"extreme", "severe"} else "default"
+    if event_class == "advisory":
+        return "default"
+    if event_class in {"statement", "outlook"}:
+        return "low"
+
+    return "default" if severity in {"extreme", "severe", "moderate"} else "low"
+
+
+def ntfy_tags_for_alert(alert: dict[str, Any], configured_tags: str) -> str:
+    """Combine configured base tags with the alert's actual product class.
+
+    Configured tags are treated as base tags only. Any product-class tag found
+    there is stale by definition, since the correct class is derived per alert,
+    so it is dropped before the real one is appended.
+    """
+    event = clean_field(alert.get("event"), "Unknown weather alert")
+    event_class = classify_event(event)
+
+    tags: list[str] = []
+    seen: set[str] = set()
+
+    for raw_tag in configured_tags.split(","):
+        tag = raw_tag.strip()
+        if not tag or tag.casefold() in EVENT_CLASS_TAGS:
+            continue
+        if tag.casefold() not in seen:
+            tags.append(tag)
+            seen.add(tag.casefold())
+
+    if event_class not in seen:
+        tags.append(event_class)
+
+    return ",".join(tags)
 
 
 def build_ntfy_url(server: str, topic: str) -> str:
@@ -617,21 +764,59 @@ def publish_test_notification(
 
 
 def alert_identity(alert: dict[str, Any]) -> str:
-    """Return a stable identifier used to suppress duplicate notifications."""
+    """Return a stable identifier for one NWS product.
+
+    This answers "is this the same alert?", not "has it changed?". NWS reuses
+    an ID across reissues of the same product, so pair this with
+    alert_fingerprint to detect updates.
+    """
     alert_id = clean_optional(
         str(alert.get("id") or alert.get("@id") or "")
     )
     if alert_id:
         return alert_id
 
-    # Defensive fallback for malformed or incomplete alert records.
-    return "|".join(
-        (
-            clean_field(alert.get("event"), "Unknown"),
-            clean_field(alert.get("headline"), "No headline"),
-            clean_field(alert.get("sent"), "Unknown"),
-        )
+    # Defensive fallback for malformed or incomplete alert records. Hashed
+    # rather than concatenated so the identifier stays bounded in length and
+    # safe to use as a JSON object key. The unit separator cannot appear in
+    # NWS text, so it cannot cause field-boundary collisions.
+    fallback = "\x1f".join(
+        clean_field(alert.get(field), "")
+        for field in ("event", "sent", "headline", "areaDesc")
     )
+    return "generated:" + hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+
+
+def alert_fingerprint(alert: dict[str, Any]) -> str:
+    """Hash the fields that make an alert meaningfully different.
+
+    NWS reissues a product under its original ID when details change, so
+    identity alone would silently swallow updates. Fields are serialized with
+    sorted keys so the hash is stable across API field ordering.
+    """
+    fields = (
+        "event",
+        "headline",
+        "severity",
+        "urgency",
+        "certainty",
+        "sent",
+        "effective",
+        "onset",
+        "expires",
+        "ends",
+        "description",
+        "instruction",
+        "messageType",
+    )
+    payload = {field: alert.get(field) for field in fields}
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def process_alerts(
@@ -661,12 +846,19 @@ def process_alerts(
         delivered = True
         if args.ntfy:
             priority = ntfy_priority_for_alert(alert, args.ntfy_priority)
+            tags = ntfy_tags_for_alert(alert, args.ntfy_tags)
+            sent = alert_sent_time(alert)
             LOGGER.info(
-                "Publishing new alert %d/%d event=%r priority=%s",
+                "Publishing new alert %d/%d event=%r class=%s nws_sent=%s "
+                "age=%s priority=%s tags=%s",
                 index,
                 total_alerts,
                 event,
+                classify_event(event),
+                sent.isoformat() if sent else "unknown",
+                format_age(alert_age_seconds(alert)),
                 priority,
+                tags or "none",
             )
 
             try:
@@ -677,7 +869,7 @@ def process_alerts(
                     title=event,
                     message=ntfy_message,
                     priority=priority,
-                    tags=args.ntfy_tags,
+                    tags=tags,
                     token=args.ntfy_token,
                 )
 
