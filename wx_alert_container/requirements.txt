@@ -1,1 +1,11 @@
 requests>=2.32,<3
+
+# MeshCore companion radio support.
+#
+# Pinned to a narrow range: 2.3.x is young and moving quickly, and this
+# program depends on specific behavior of create_serial (it performs the
+# firmware appstart handshake internally and returns None rather than raising
+# when the device does not answer).
+#
+# Pulls in bleak, which is unavoidable even though only serial is used here.
+meshcore>=2.3.8,<2.4

@@ -3,8 +3,22 @@
 __pycache__/
 *.py[cod]
 *.log
-.env
 .venv/
 venv/
 .DS_Store
 README.md
+
+# Never bake credentials into an image layer. The tracked config.ini is a
+# safe template; the real one is bind-mounted at runtime.
+.env
+.env.example
+config.local.ini
+*.local.ini
+
+# Not needed at runtime, and excluding them keeps the image small and the
+# build cache from busting on every test edit.
+tests/
+docker-compose.yml
+.pytest_cache/
+.ruff_cache/
+pyproject.toml

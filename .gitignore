@@ -1,1 +1,36 @@
-ignored
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local operator config and runtime state.
+# config.ini is tracked, but only as a safe template: the ntfy TOPIC and TOKEN
+# behave as bearer secrets, so real values belong in a runtime-mounted file.
+config.local.ini
+*.local.ini
+notified-alerts.json
+data/
+
+# Per-host compose settings: the serial device path and its group ID differ
+# on every machine. .env.example is tracked in its place.
+.env
+!.env.example
+
+# Logs
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

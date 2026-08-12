@@ -1,0 +1,97 @@
+# wx-alert deployment.
+#
+# Compose exists here mainly because the docker run equivalent is long enough
+# to get wrong: it needs a device mapping, a supplementary group, a named
+# volume, and a secrets overlay. Encoding that once removes a class of
+# deployment mistakes.
+#
+# Before first use, copy .env.example to .env and set MESHCORE_DEVICE and
+# MESHCORE_DEVICE_GID for this host.
+
+services:
+  wx-alert:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wx-alert:1.1.0
+    container_name: wx-alert
+
+    # Restart on failure is what recovers a replugged USB radio. The program
+    # exits non-zero after EXIT_AFTER_FAILED_CYCLES consecutive failures
+    # precisely so this policy can recreate the container against the device
+    # as it currently exists. A container that merely reports unhealthy would
+    # sit there failing forever, because Docker does not act on health status.
+    restart: unless-stopped
+
+    command: ["--ntfy", "--meshcore", "--loop"]
+
+    devices:
+      # Host device on the left, fixed in-container path on the right.
+      #
+      # Use a /dev/serial/by-id/ path for the host side. USB enumeration order
+      # changes across reboots, so /dev/ttyACM0 will eventually point at
+      # something else. Find yours with:
+      #
+      #   ls -l /dev/serial/by-id/
+      #
+      # Mapping it to a fixed /dev/meshcore keeps config.ini portable across
+      # hosts and radios.
+      - "${MESHCORE_DEVICE:?set MESHCORE_DEVICE in .env}:/dev/meshcore"
+
+    # The container runs as the unprivileged wxalert user (UID 10001), but
+    # serial devices are typically root:dialout with mode 660, so the process
+    # needs the device's group to open it. This must be the numeric GID *on
+    # the host*, because the container's /etc/group knows nothing about it.
+    # Find it with:
+    #
+    #   stat -c '%g %G' "$(readlink -f /dev/serial/by-id/YOUR-RADIO)"
+    #
+    # Commonly 20 (dialout) on Debian and Ubuntu, 18 on Fedora, 14 (uucp) on
+    # Arch. Granting one supplementary group is far preferable to the
+    # privileged: true that this problem usually attracts.
+    group_add:
+      - "${MESHCORE_DEVICE_GID:?set MESHCORE_DEVICE_GID in .env}"
+
+    volumes:
+      # Delivery history. Without this the container re-announces every active
+      # alert on each restart, which on a shared LoRa channel is a burst of
+      # flood-routed traffic every time.
+      - wx-alert-data:/data
+
+      # Real credentials, kept out of the image and out of git. The tracked
+      # config.ini is a template with a blank ntfy topic and token; this
+      # overlay supplies the live values. Create it by copying config.ini and
+      # filling in the secrets.
+      #
+      # create_host_path is disabled deliberately. The short "./x:/y" form
+      # defaults to true, which means a missing config.local.ini is silently
+      # created as an empty *directory* and mounted over /app/config.ini,
+      # producing a confusing IsADirectoryError at startup. Failing to start
+      # with a clear message about the missing file is far better.
+      - type: bind
+        source: ./config.local.ini
+        target: /app/config.ini
+        read_only: true
+        bind:
+          create_host_path: false
+
+    # Defence in depth. The process needs no elevated capability: it opens a
+    # serial device it has group access to, and makes outbound HTTPS requests.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # The application writes only to /data.
+    read_only: true
+
+    # Without a cap, a persistent failure loop can fill the host disk with
+    # logs, which takes down more than this container.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wx-alert-data:
