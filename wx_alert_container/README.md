@@ -349,6 +349,35 @@ deasserted so GPIO0 stays high while only RTS is pulsed. Reversing that would
 strand the radio in the bootloader, where it answers nothing until someone
 physically power-cycles it.
 
+### If the radio hangs every time it transmits, check transmit power first
+
+On the radio this was developed against, the hang was caused by running the
+transmitter at its maximum rated power. At `tx_power = 22`, the maximum the
+board reports, a single channel message hung the firmware every time: the send
+returned `OK`, and seconds later the radio stopped answering even a battery
+query on the still-open connection. Dropping to **20** eliminated it — four
+consecutive transmissions with no fault, where 22 had failed on the first.
+
+Two decibels is a small change on the air and a large one for the power
+amplifier, which draws its peak current at full output. A charged LiPo on the
+board did not prevent it, so do not rule this out just because the radio has a
+battery.
+
+The symptom is distinctive, and it looks nothing like a power problem:
+
+- the send returns `OK`, so the message may well go out
+- the USB device stays present and `/dev/serial/by-id/` does not change
+- the kernel logs no USB reset, because the USB-serial bridge is a separate
+  chip and never lost power
+- only the reset pin brings it back
+
+If this is happening, lower `tx_power` on the radio before suspecting
+this program, the serial library, or the cable:
+
+```python
+await mc.commands.set_tx_power(20)   # persists across reboots
+```
+
 ---
 
 ## Container image
