@@ -23,6 +23,11 @@ config.local.ini
 notified-alerts.json
 data/
 
+# Per-host compose settings: the serial device path and its group ID differ
+# on every machine. .env.example is tracked in its place.
+.env
+!.env.example
+
 # Logs
 *.log
 
