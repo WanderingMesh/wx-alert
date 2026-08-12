@@ -26,7 +26,5 @@ wx_alert_container/     Docker build context and application source
 
 ## Configuration secrets
 
-`config.ini` is tracked in git as a template and must not contain real
-credentials. The ntfy `TOPIC` and `TOKEN` both act as bearer secrets: anyone
-holding a topic name can read and publish to it. Supply real values by
-bind-mounting a config file at runtime, as described in the container README.
+`config.ini` is tracked in git as a template.  The only real 'secrets' are 
+the ntfy.sh TOPIC values.  But it's hard to call this a security consideration.  
