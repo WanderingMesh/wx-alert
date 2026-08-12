@@ -38,10 +38,11 @@ services:
       # hosts and radios.
       - "${MESHCORE_DEVICE:?set MESHCORE_DEVICE in .env}:/dev/meshcore"
 
-    # The container runs as nonroot (UID 65532), but serial devices are
-    # typically root:dialout with mode 660, so the process needs the device's
-    # group to open it. This must be the numeric GID *on the host*, because
-    # the container's /etc/group knows nothing about it. Find it with:
+    # The container runs as the unprivileged wxalert user (UID 10001), but
+    # serial devices are typically root:dialout with mode 660, so the process
+    # needs the device's group to open it. This must be the numeric GID *on
+    # the host*, because the container's /etc/group knows nothing about it.
+    # Find it with:
     #
     #   stat -c '%g %G' "$(readlink -f /dev/serial/by-id/YOUR-RADIO)"
     #

@@ -90,8 +90,9 @@ a different device.
 
 ### 2. Find the device's group
 
-The container runs as a nonroot user, and serial devices are usually
-`root:dialout` mode 660, so the process needs the device's group to open it:
+The container runs as the unprivileged `wxalert` user (UID 10001), and serial
+devices are usually `root:dialout` mode 660, so the process needs the device's
+group to open it:
 
 ```bash
 stat -c '%g %G' "$(readlink -f /dev/serial/by-id/YOUR-RADIO)"
@@ -242,6 +243,35 @@ recreating the container against the current device will.
 ```bash
 docker inspect --format '{{.State.Health.Status}}' wx-alert
 ```
+
+---
+
+## Container image
+
+Built from `python:3.13-slim-trixie` in two stages, so the pip toolchain used
+to create the virtualenv stays out of the runtime image. No apt packages are
+installed: every dependency ships prebuilt manylinux wheels, so no compiler
+or extra shared library is needed.
+
+The base tag is pinned to the Debian codename deliberately. Plain `slim` would
+follow Debian to its next stable release and change the OS under the
+application; `3.13-slim-trixie` still picks up CPython patch releases and
+Debian security updates when you rebuild.
+
+The process runs as `wxalert`, UID **10001**, with no home directory and no
+login shell. The UID is fixed rather than auto-assigned because it owns the
+`/data` volume — a UID that drifted between rebuilds would leave the container
+unable to read back its own history, and it would re-announce every active
+alert.
+
+> If you are upgrading from a build that used a different UID, either
+> `chown -R 10001:10001` the volume contents or start from a fresh volume and
+> accept one round of duplicate notifications.
+
+The compose file additionally runs the container read-only, drops all
+capabilities, and sets `no-new-privileges`. The process needs none of them: it
+opens a serial device it has group access to, and makes outbound HTTPS
+requests. It writes only to `/data`.
 
 ---
 

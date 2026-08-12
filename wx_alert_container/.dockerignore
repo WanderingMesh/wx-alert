@@ -18,7 +18,6 @@ config.local.ini
 # Not needed at runtime, and excluding them keeps the image small and the
 # build cache from busting on every test edit.
 tests/
-Dockerfile.verify
 docker-compose.yml
 .pytest_cache/
 .ruff_cache/

@@ -19,7 +19,7 @@ configuration, build, and deployment instructions.
 wx_alert_container/     Docker build context and application source
   wx_alert/             Application package
   config.ini            Configuration template (no secrets)
-  Dockerfile            Multi-stage build on Docker Hardened Images
+  Dockerfile            Multi-stage build, runs as an unprivileged user
   docker-compose.yml    Deployment, including serial device passthrough
   tests/                Test suite
 ```
