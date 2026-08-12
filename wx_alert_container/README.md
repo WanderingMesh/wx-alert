@@ -37,6 +37,25 @@ An ntfy topic name is a bearer secret: anyone who knows it can both read your
 alerts and publish to your topic. Keep real values in `config.local.ini`,
 which is gitignored and bind-mounted over the baked-in file at runtime.
 
+`config.local.ini` must be readable by UID 10001, the unprivileged user the
+container runs as. A bind mount carries host ownership through unchanged, so a
+file created with a restrictive umask fails at startup with
+`Permission denied: '/app/config.ini'`. Either make it world-readable:
+
+```bash
+chmod 644 config.local.ini
+```
+
+or, to keep it off-limits to other local users, give it to the container's
+group and grant read access to that group alone:
+
+```bash
+sudo chgrp 10001 config.local.ini && chmod 640 config.local.ini
+```
+
+The second form needs root, because your login account is not a member of a
+group that only exists inside the image.
+
 Minimum viable configuration:
 
 ```ini
@@ -101,7 +120,25 @@ stat -c '%g %G' "$(readlink -f /dev/serial/by-id/YOUR-RADIO)"
 Put both values in `.env`. Granting one supplementary group is much better
 than the `privileged: true` this problem usually attracts.
 
-### 3. Preview messages without transmitting
+### 3. Confirm which channel you are about to use
+
+`CHANNEL_INDEX` refers to a channel slot configured on the radio itself, not
+in this project. The mapping from index to name is whatever you set in the
+MeshCore app, so an index alone tells you nothing about where traffic lands.
+
+**Index 0 is conventionally `Public`, which is almost never where an automated
+alert feed belongs.** Put alerts on a dedicated channel and confirm the name
+before enabling the loop. The self-test in step 5 resolves and logs the name:
+
+```text
+INFO MeshCore connected port=/dev/meshcore node='LNM-WXA' channel=1
+     name='#rno-wx-alerts' text_budget=141 bytes
+```
+
+If that name is not the channel you intended, fix `CHANNEL_INDEX` before going
+any further.
+
+### 4. Preview messages without transmitting
 
 `--meshcore-dry-run` renders every message and logs it with its byte size,
 without opening the serial port. Review the formatting before you occupy a
@@ -117,7 +154,7 @@ INFO MeshCore dry-run channel=0 bytes=124/141 text='Flash Flood Warning: Washoe
 County, til Thu 21:00. Move to higher ground now. Avoid flooded roadways.'
 ```
 
-### 4. Transmit one test message
+### 5. Transmit one test message
 
 This connects, reports the node name and channel, sends one message, and
 exits:
@@ -127,13 +164,14 @@ docker compose run --rm wx-alert --meshcore-test
 ```
 
 ```text
-INFO MeshCore connected port=/dev/meshcore node='WX-Reno' channel=0
-     name='Public' text_budget=141 bytes
-INFO MeshCore test transmitted channel=0 bytes=57
+INFO MeshCore connected port=/dev/meshcore node='WX-Reno' channel=1
+     name='#rno-wx-alerts' text_budget=141 bytes
+INFO MeshCore test transmitted channel=1 bytes=57
 ```
 
-If the channel index is wrong or the radio does not answer, this fails here
-rather than silently doing the wrong thing for a week.
+Check the reported channel name, then confirm on a second node that the
+message actually arrived. If the channel index is wrong or the radio does not
+answer, this fails here rather than silently doing the wrong thing for a week.
 
 ---
 
