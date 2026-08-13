@@ -121,6 +121,80 @@ If the `/points` lookup fails and nothing is cached, the program refuses to
 start unless `ZONES` is set explicitly. An empty zone list would return an empty
 alert list, and the container would report quiet weather indefinitely.
 
+### Finding your county codes
+
+You do not need any of this to get started. The county containing your
+coordinates is resolved automatically, and leaving `ZONES` blank is a perfectly
+good configuration. This is only for adding the *neighbouring* counties a
+wide-area mesh reaches into, since a radio network's footprint pays no
+attention to county lines.
+
+**Ask about a specific place.** The most direct method: pick a coordinate in a
+town your mesh actually covers and ask which county contains it.
+
+NWS requires a `product/version (contact)` User-Agent and its edge returns a
+bare `403` without one, so the version token is not decoration.
+
+```bash
+curl -s -H "User-Agent: wx-alert/1.0 (you@yourdomain.org)" \
+  https://api.weather.gov/points/39.5296,-119.8138 \
+  | grep -E '"(county|forecastZone)": "'
+```
+
+```json
+"forecastZone": "https://api.weather.gov/zones/forecast/NVZ003",
+"county": "https://api.weather.gov/zones/county/NVC031",
+```
+
+The last path segment is the code. Take the one on the `county` line —
+`NVC031`. The forecast zone sits directly beside it in the same response and
+looks just as official, which is exactly how the wrong one gets copied into a
+config file. Repeat for each town you want covered.
+
+**Or list every county in a state and pick by name.**
+
+```bash
+curl -s -H "User-Agent: wx-alert/1.0 (you@yourdomain.org)" \
+  "https://api.weather.gov/zones?type=county&area=NV" \
+  | python3 -c 'import json,sys; [print(f["properties"]["id"], f["properties"]["name"]) for f in json.load(sys.stdin)["features"]]' \
+  | sort
+```
+
+```
+NVC001 Churchill
+NVC003 Clark
+NVC005 Douglas
+NVC007 Elko
+...
+NVC019 Lyon
+NVC029 Storey
+NVC031 Washoe
+NVC510 Carson City
+```
+
+Seventeen entries for Nevada, which is one more than it has counties: Carson
+City is an independent city and gets its own code. Virginia has dozens of
+these, so list rather than assume.
+
+The three digits are the county's FIPS code, so `NVC031` is Nevada FIPS 031,
+Washoe. If you already know a county's FIPS number you can construct the code
+directly.
+
+**Then confirm what the program actually queried.** Whatever you configure, the
+startup log states the resolved county and the full query set. Check it once
+after any change:
+
+```
+INFO Resolved monitored point to county zone=NVC031 latitude=39.5296 longitude=-119.8138
+INFO Monitoring zones=NVC031,NVC029,NVC019 radius=50km point=39.5296,-119.8138
+```
+
+If any code in that list has a `Z` in the third position, storm-based warnings
+from that zone will never arrive and nothing further will be logged about it.
+A bad code is rejected at startup, but a *valid* forecast zone code is accepted
+and simply returns less — which is why this is worth one look at the log rather
+than trusting the config file.
+
 ### Which alerts get sent where
 
 The two transports deliberately have different postures, because the cost of
