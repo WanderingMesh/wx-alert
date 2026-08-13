@@ -24,7 +24,9 @@ import asyncio
 import logging
 import random
 import threading
+from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
 from typing import Any
 
 from ..mesh_format import build_mesh_message, mesh_text_budget
@@ -40,6 +42,21 @@ LOGGER = logging.getLogger("wx-alert")
 # Used when the radio reports no name, so the budget stays conservative
 # rather than optimistic.
 _FALLBACK_NODE_NAME = "X" * 32
+
+# Longest the transport will hold a poll cycle open to satisfy minimum
+# transmission spacing.
+#
+# Waiting is preferable to postponing: at the default 30 second spacing a batch
+# of six alerts from a county query drains inside one cycle instead of taking
+# six cycles and half an hour, by which point a Flash Flood Warning has
+# expired. Past a couple of minutes that reverses, because the wait delays the
+# next NWS query and every alert queued behind this one, so an unusually large
+# MIN_SECONDS_BETWEEN_SENDS defers instead.
+MAX_SPACING_WAIT_SECONDS = 120
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class _AsyncBridge:
@@ -123,6 +140,8 @@ class MeshCoreTransport:
         reset_settle: float = 3.0,
         dry_run: bool = False,
         debug: bool = False,
+        clock: Callable[[], datetime] = _utcnow,
+        sleep: Callable[[float], bool] = STOP_EVENT.wait,
     ) -> None:
         self._port = port
         self._baud = baud
@@ -139,6 +158,13 @@ class MeshCoreTransport:
         self._reset_settle = reset_settle
         self._dry_run = dry_run
         self._debug = debug
+
+        # Airtime is metered against a real clock rather than the cycle
+        # timestamp in DeliveryContext, and slept through an interruptible wait
+        # rather than time.sleep, so a pending gap cannot hold the container
+        # open past its stop grace period. Both are injectable for testing.
+        self._clock = clock
+        self._sleep = sleep
 
         self._bridge: _AsyncBridge | None = None
         self._meshcore: Any = None
@@ -313,6 +339,8 @@ class MeshCoreTransport:
         # never touches the rate limiter's budget or the radio.
         accepted, reason = self._relevance.accepts(alert)
         if not accepted:
+            # Terminal: relevance is derived from the alert's own content, so
+            # the answer cannot change while the content stays the same.
             return DeliveryResult.SKIPPED, f"filtered: {reason}"
 
         suppress, reason = should_suppress_on_startup(
@@ -320,13 +348,18 @@ class MeshCoreTransport:
             self._startup_policy,
             context.first_cycle,
             context.now,
+            previously_handled=context.previously_handled,
         )
         if suppress:
             return DeliveryResult.SKIPPED, f"startup-stale: {reason}"
 
-        allowed, reason = self._rate_limiter.check(context.now)
+        # Deferred, not skipped: an airtime budget refills. Recording this as
+        # settled would retire the alert permanently over a gap of seconds,
+        # which is how a batch of alerts used to lose everything but its first
+        # member.
+        allowed, reason = self._await_capacity()
         if not allowed:
-            return DeliveryResult.SKIPPED, f"rate-limit: {reason}"
+            return DeliveryResult.DEFERRED, f"rate-limit: {reason}"
 
         # The copy marker is appended to each transmission, so the rendered
         # message has to leave room for it.
@@ -342,7 +375,7 @@ class MeshCoreTransport:
                 self._budget,
                 text,
             )
-            self._rate_limiter.record(context.now)
+            self._rate_limiter.record(self._clock())
             return DeliveryResult.SENT, f"dry-run bytes={size}/{self._budget}"
 
         try:
@@ -356,7 +389,7 @@ class MeshCoreTransport:
             self._drop_connection()
             return DeliveryResult.FAILED, f"{type(exc).__name__}: {exc}"
 
-        self._rate_limiter.record(context.now)
+        self._rate_limiter.record(self._clock())
 
         LOGGER.info(
             "MeshCore transmitted event=%r channel=%d bytes=%d/%d copies=%d "
@@ -384,6 +417,48 @@ class MeshCoreTransport:
             self._bridge = None
 
     # -- internals --------------------------------------------------------
+
+    def _await_capacity(self) -> tuple[bool, str]:
+        """Obtain permission to transmit, waiting out minimum spacing.
+
+        Measured against a real clock. DeliveryContext.now is stamped once per
+        poll cycle and shared by every alert in it, so metering against it
+        reads zero elapsed time between consecutive transmissions and refuses
+        everything after the first for a spacing violation that real time had
+        already satisfied.
+
+        Spacing is waited out here rather than postponed to the next cycle so
+        that a batch of alerts drains at the configured rate instead of one
+        alert per poll interval. The hourly cap is not waited for: capacity can
+        be nearly an hour away, and the alert is offered again next cycle for
+        as long as NWS still lists it as active.
+        """
+        now = self._clock()
+        allowed, reason = self._rate_limiter.check(now)
+
+        if allowed:
+            return True, ""
+
+        if self._rate_limiter.cap_reached(now):
+            return False, reason
+
+        wait = self._rate_limiter.seconds_until_ready(now)
+
+        if wait > MAX_SPACING_WAIT_SECONDS:
+            return False, reason
+
+        LOGGER.info(
+            "Holding %ds for MeshCore transmission spacing (%s)",
+            wait,
+            reason,
+        )
+
+        if self._sleep(wait):
+            # Shutdown, not a rate-limit decision. Deferring leaves the alert
+            # outstanding for whoever starts next.
+            return False, "shutdown requested while waiting for airtime"
+
+        return self._rate_limiter.check(self._clock())
 
     def _copy_label(self, index: int) -> str:
         """The marker distinguishing one copy of a message from another.

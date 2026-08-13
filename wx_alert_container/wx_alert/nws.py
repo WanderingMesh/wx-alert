@@ -161,6 +161,26 @@ def alert_age_seconds(
     return max(0, int((current - sent).total_seconds()))
 
 
+def alert_remaining_seconds(
+    alert: dict[str, Any],
+    now: datetime | None = None,
+) -> int | None:
+    """Return how much longer an alert applies, or None if that is unknown.
+
+    The complement of alert_age_seconds, and the better question to ask about
+    a product on a shared radio channel: when a warning was issued says
+    nothing about whether it still matters, while the time it has left says
+    exactly that. Zero means it has lapsed.
+    """
+    expiry = alert_expiry_time(alert)
+    if expiry is None:
+        return None
+
+    current = now or datetime.now(timezone.utc)
+
+    return max(0, int((expiry - current).total_seconds()))
+
+
 def format_age(seconds: int | None) -> str:
     """Render an age in compact human-readable form for log lines."""
     if seconds is None:

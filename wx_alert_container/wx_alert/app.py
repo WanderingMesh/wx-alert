@@ -12,10 +12,12 @@ from .formatting import build_compact_stdout_message, build_verbose_message
 from .geo import geometry_distance_km
 from .health import heartbeat_path, write_heartbeat
 from .nws import (
+    EVENT_CLASS_RANK,
     alert_age_seconds,
     alert_class,
     alert_geometry,
     alert_sent_time,
+    alert_severity_rank,
     format_age,
     get_active_alerts,
 )
@@ -118,6 +120,27 @@ def filter_by_proximity(
     return kept
 
 
+def prioritize(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order alerts loudest first, by product class then CAP severity.
+
+    NWS returns active alerts in no particular order of importance, and a
+    county query returns several at once. Anything downstream that runs out of
+    budget mid-batch — the radio's hourly cap, or a cycle cut short by a
+    shutdown — therefore used to spend what it had on whichever product
+    happened to be listed first. A Special Weather Statement could consume the
+    airtime that a Tornado Warning in the same response needed.
+
+    Python's sort is stable, so alerts of equal rank keep the order NWS gave.
+    """
+    return sorted(
+        alerts,
+        key=lambda alert: (
+            -EVENT_CLASS_RANK[alert_class(alert)],
+            -alert_severity_rank(alert),
+        ),
+    )
+
+
 def deliver_alert(
     alert: dict[str, Any],
     transports: Sequence[Transport],
@@ -148,7 +171,13 @@ def deliver_alert(
             continue
 
         try:
-            result, detail = transport.deliver(alert, context)
+            result, detail = transport.deliver(
+                alert,
+                # Whether this transport has had a turn at this alert before is
+                # what lets its startup staleness policy tell a cold-start
+                # backlog from a retry after a failure.
+                context.for_transport(state.has_record(alert, transport.name)),
+            )
         except Exception as exc:  # noqa: BLE001 - a transport bug must not
             # take down the poller; the alert simply stays eligible for retry.
             failures += 1
@@ -180,6 +209,21 @@ def deliver_alert(
                 detail,
             )
             state.record(alert, transport.name, f"skipped:{detail}")
+        elif result is DeliveryResult.DEFERRED:
+            # Deliberately not recorded, and deliberately not a failure. The
+            # transport would have carried this alert but could not right now,
+            # for a reason that clears without intervention, so it stays
+            # outstanding and is offered again next cycle. Recording it would
+            # retire the alert over a condition that has already passed;
+            # counting it as a failure would eventually restart the container
+            # over one that was never an error.
+            LOGGER.warning(
+                "Delivery deferred to the next cycle transport=%s event=%r "
+                "reason=%s",
+                transport.name,
+                event,
+                detail,
+            )
         else:
             failures += 1
             if failed_transports is not None:
@@ -291,13 +335,17 @@ def perform_alert_check(
     context = DeliveryContext.create(first_cycle=first_cycle)
 
     # An alert is outstanding while any enabled transport has yet to reach a
-    # terminal outcome for this exact version of it.
+    # terminal outcome for this exact version of it. Ordered loudest first, so
+    # a transport that runs out of airtime part way through a batch spends what
+    # it had on the most urgent products rather than the earliest-listed ones.
     names = settlement_names(transports)
-    outstanding = [
-        alert
-        for alert in alerts
-        if any(not state.is_settled(alert, name) for name in names)
-    ]
+    outstanding = prioritize(
+        [
+            alert
+            for alert in alerts
+            if any(not state.is_settled(alert, name) for name in names)
+        ]
+    )
 
     LOGGER.info(
         "NWS returned %d active alert(s); %d outstanding; %d already handled",

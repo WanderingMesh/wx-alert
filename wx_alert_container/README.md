@@ -280,9 +280,13 @@ any further.
 without opening the serial port. Review the formatting before you occupy a
 shared channel with it:
 
+`--meshcore-startup-max-age 0` disables the radio's startup staleness limit for
+this run, so currently active alerts are rendered rather than suppressed as
+old news. (`--startup-max-age` governs ntfy and has no effect on the radio.)
+
 ```bash
 docker compose run --rm wx-alert \
-  --once --meshcore --meshcore-dry-run --startup-max-age 0
+  --once --meshcore --meshcore-dry-run --meshcore-startup-max-age 0
 ```
 
 ```text
@@ -351,23 +355,59 @@ Every MeshCore channel message is flood-routed and rebroadcast by every
 repeater in range, so it occupies the channel for everyone nearby. Three
 independent gates sit in front of the radio.
 
-**Relevance.** `MIN_CLASS` and `MIN_SEVERITY` must both be satisfied.
+**Relevance.** `MIN_CLASS` and `MIN_SEVERITY` must both be satisfied. This gate
+is the only one whose decision is final, because it is derived purely from the
+alert's own content: the same product will always be judged the same way, so
+there is nothing to reconsider later.
 
 **Rate limiting.** `MIN_SECONDS_BETWEEN_SENDS` and `MAX_SENDS_PER_HOUR` bound
-consumption regardless of relevance. Alerts over the cap are refused and
-logged, not queued: a weather alert delivered forty minutes late is worse
-than useless.
+consumption regardless of relevance.
+
+Minimum spacing is waited out within the cycle. A county query commonly returns
+several active alerts at once, and refusing every one after the first would put
+a single alert per poll interval on the air — at a five minute interval, half an
+hour to clear six alerts, by which point a Flash Flood Warning has expired.
+Spacing longer than two minutes is not waited for, since holding the cycle open
+that long delays the next NWS query and everything behind it.
+
+Hourly capacity is not waited for at all; the alert is simply offered again on
+the next cycle for as long as NWS still lists it as active. Neither limit
+records anything: an alert refused for want of airtime is **deferred, never
+settled**, or a full budget would permanently discard a warning that a batch of
+statements had crowded out.
+
+Alerts are dispatched loudest first, by product class and then CAP severity, so
+a budget that runs out mid-batch is spent on the most urgent products rather
+than on whichever ones NWS happened to list first.
 
 **Startup staleness.** The NWS API returns every *currently active* alert, not
 only newly issued ones, so a restart is indistinguishable from a burst of new
 alerts. On the first cycle, products older than `STARTUP_MAX_AGE_SECONDS` are
-recorded as suppressed rather than announced.
+recorded as suppressed rather than announced. Unlike a rate-limit refusal this
+one is deliberately final: the alert is old news, and re-offering it on the
+second cycle would announce it four minutes later and achieve nothing.
 
-On ntfy, active warnings bypass the staleness limit, because silently
-swallowing an ongoing warning is worse than a duplicate notification. On the
-radio they do not, because a duplicate push costs nothing while replaying
-hours-old warnings onto a shared channel after every restart costs everyone
-airtime.
+Because it is final, the decision has three parts rather than one.
+
+- An alert this transport has **already recorded an outcome for** is never
+  treated as backlog. Either NWS reissued the product, or the previous attempt
+  failed and this is the retry — and a radio that was unreachable throughout a
+  warning must not have that warning written off the moment it recovers.
+- On ntfy, active warnings bypass the limit unconditionally, because silently
+  swallowing an ongoing warning is worse than a duplicate notification.
+- On the radio they do not, because a duplicate push costs nothing while
+  replaying hours-old warnings onto a shared channel after every restart costs
+  everyone airtime. Instead the radio asks how much life a warning has left: a
+  warning still in force for at least `STARTUP_MAX_AGE_SECONDS` is broadcast
+  however old it is, and one about to expire is not. How old a warning is says
+  nothing about whether it still matters; the time it has left says exactly
+  that.
+
+The practical case this covers: a Flash Flood Warning issued 50 minutes ago and
+in force for another two hours, when the container restarts mid-event — which
+`restart: unless-stopped` and `EXIT_AFTER_FAILED_CYCLES` make a routine event,
+not an unusual one. It is old by age and it is the most important thing
+happening.
 
 > A channel message is an unacknowledged broadcast. A successful send means
 > the frame was accepted for transmission by the radio. Nothing in this
@@ -450,6 +490,13 @@ duplicates the notification or permanently skips the broadcast.
 An alert is considered handled only when its **content fingerprint** matches.
 NWS reissues products under the original ID when details change, so comparing
 IDs alone would silently swallow updates.
+
+Only *terminal* outcomes are recorded: delivered, or skipped by a decision that
+cannot change. An alert declined for a reason that clears on its own — no
+airtime budget left, most often — is deferred and deliberately left absent from
+the file, so the next cycle picks it up again. Recording those would retire an
+alert over a condition that had already passed, which is how a warning could be
+fetched correctly and then never transmitted at all.
 
 State from an earlier single-transport build is migrated automatically on
 first read. Its history is attributed to ntfy, and the radio is treated as
@@ -653,7 +700,7 @@ docker compose run --rm wx-alert --ntfy --loop --verbose
 
 # Preview radio output for one cycle without transmitting
 docker compose run --rm wx-alert \
-  --meshcore --meshcore-dry-run --once --startup-max-age 0
+  --meshcore --meshcore-dry-run --once --meshcore-startup-max-age 0
 
 # Inspect delivery history
 docker compose exec wx-alert python -m json.tool /data/notified-alerts.json

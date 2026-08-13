@@ -97,3 +97,32 @@ class TestRateLimiter:
         limiter.record(now)
         assert limiter.seconds_until_ready(now + timedelta(seconds=20)) == 40
         assert limiter.seconds_until_ready(now + timedelta(seconds=90)) == 0
+
+    def test_the_reported_wait_is_rounded_up(self, now):
+        # A caller that sleeps for this long must find capacity waiting when it
+        # asks again. Truncating a fractional second would send it back round.
+        limiter = RateLimiter(min_interval_seconds=30, max_per_hour=0)
+        limiter.record(now)
+
+        wait = limiter.seconds_until_ready(now + timedelta(seconds=29.5))
+
+        assert wait == 1
+        assert limiter.check(now + timedelta(seconds=29.5 + wait))[0]
+
+    def test_distinguishes_the_cap_from_spacing(self, now):
+        # The two clear on wildly different timescales: spacing is worth waiting
+        # out inside a poll cycle, an hour of capacity is not.
+        spacing_only = RateLimiter(min_interval_seconds=30, max_per_hour=0)
+        spacing_only.record(now)
+        assert not spacing_only.check(now)[0]
+        assert not spacing_only.cap_reached(now)
+
+        capped = RateLimiter(min_interval_seconds=0, max_per_hour=1)
+        capped.record(now)
+        assert capped.cap_reached(now)
+
+    def test_the_cap_is_not_reached_when_disabled(self, now):
+        unlimited = RateLimiter(min_interval_seconds=0, max_per_hour=0)
+        for index in range(50):
+            unlimited.record(now + timedelta(seconds=index))
+        assert not unlimited.cap_reached(now + timedelta(seconds=50))

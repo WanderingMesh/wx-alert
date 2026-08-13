@@ -53,6 +53,30 @@ class TestSettlement:
         state.record(flood_watch, "meshcore", "skipped:filtered")
         assert state.is_settled(flood_watch, "meshcore")
 
+    def test_has_record_survives_a_reissue(self, flood_watch):
+        # is_settled goes false again when NWS reissues the product, which is
+        # correct for delivery but useless for asking "has this transport had a
+        # turn at this alert?" — the question the staleness policy needs.
+        state = AlertState()
+        state.record(flood_watch, "meshcore", "delivered")
+        updated = dict(flood_watch, description="the situation has changed")
+
+        assert not state.is_settled(updated, "meshcore")
+        assert state.has_record(updated, "meshcore")
+
+    def test_has_record_is_per_transport(self, flood_watch):
+        # An alert the radio has never recorded is new to the radio even if
+        # ntfy pushed it an hour ago. This is also what keeps a migrated
+        # single-transport state file from replaying its backlog on air.
+        state = AlertState()
+        state.record(flood_watch, "ntfy", "delivered")
+
+        assert state.has_record(flood_watch, "ntfy")
+        assert not state.has_record(flood_watch, "meshcore")
+
+    def test_has_record_is_false_for_an_unknown_alert(self, flood_watch):
+        assert not AlertState().has_record(flood_watch, "meshcore")
+
 
 class TestPersistence:
     def test_round_trips(self, tmp_path, flood_watch):
@@ -228,3 +252,80 @@ class TestStartupPolicy:
         )
         assert suppress
         assert "unavailable" in reason
+
+    def test_an_alert_this_transport_already_handled_is_not_a_backlog(
+        self, policy, flood_watch, now
+    ):
+        # Persistent state proves this transport has had a turn at this alert,
+        # so it did not arrive with the cold-start backlog. Either NWS reissued
+        # it, or the last attempt failed and this is the retry — and a radio
+        # that was unreachable throughout a warning must not have that warning
+        # written off the moment it comes back.
+        assert not should_suppress_on_startup(
+            flood_watch, policy, True, now, previously_handled=True
+        )[0]
+
+
+class TestStartupPolicyRemainingLife:
+    """The radio's alternative to an unconditional warning bypass.
+
+    How old a warning is says nothing about whether it still matters. How long
+    it has left to run says exactly that, which lets the radio carry a warning
+    that is still in force without replaying an expired backlog.
+    """
+
+    @pytest.fixture
+    def policy(self):
+        return StartupPolicy(
+            max_age_seconds=900,
+            always_notify_warnings=False,
+            warning_min_remaining_seconds=900,
+        )
+
+    def warning(self, now, issued_hours_ago, expires_in_minutes):
+        return {
+            "event": "Tornado Warning",
+            "sent": (now - timedelta(hours=issued_hours_ago)).isoformat(),
+            "expires": (now + timedelta(minutes=expires_in_minutes)).isoformat(),
+        }
+
+    def test_an_old_warning_still_in_force_is_allowed(self, policy, now):
+        alert = self.warning(now, issued_hours_ago=4, expires_in_minutes=45)
+        assert not should_suppress_on_startup(alert, policy, True, now)[0]
+
+    def test_an_old_warning_about_to_expire_is_suppressed(self, policy, now):
+        # Two minutes of validity left is not worth a flood-routed broadcast.
+        alert = self.warning(now, issued_hours_ago=4, expires_in_minutes=2)
+        suppress, reason = should_suppress_on_startup(alert, policy, True, now)
+        assert suppress
+        assert "exceeds startup limit" in reason
+
+    def test_an_expired_warning_is_suppressed(self, policy, now):
+        alert = self.warning(now, issued_hours_ago=4, expires_in_minutes=-30)
+        assert should_suppress_on_startup(alert, policy, True, now)[0]
+
+    def test_the_bypass_does_not_extend_to_lesser_products(self, policy, now):
+        # A watch running for another six hours is exactly the backlog this
+        # policy exists to keep off a shared channel.
+        watch = {
+            "event": "Flood Watch",
+            "sent": (now - timedelta(hours=4)).isoformat(),
+            "expires": (now + timedelta(hours=6)).isoformat(),
+        }
+        assert should_suppress_on_startup(watch, policy, True, now)[0]
+
+    def test_a_warning_with_no_expiry_falls_back_to_age(self, policy, now):
+        alert = {
+            "event": "Tornado Warning",
+            "sent": (now - timedelta(hours=4)).isoformat(),
+        }
+        assert should_suppress_on_startup(alert, policy, True, now)[0]
+
+    def test_zero_disables_the_remaining_life_test(self, now):
+        without = StartupPolicy(
+            max_age_seconds=900,
+            always_notify_warnings=False,
+            warning_min_remaining_seconds=0,
+        )
+        alert = self.warning(now, issued_hours_ago=4, expires_in_minutes=45)
+        assert should_suppress_on_startup(alert, without, True, now)[0]

@@ -18,6 +18,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from math import ceil
 from typing import Any
 
 from .nws import EVENT_CLASS_RANK, SEVERITY_RANK, alert_class, alert_severity_rank
@@ -67,10 +68,12 @@ class RelevanceFilter:
 class RateLimiter:
     """Bounds transmissions by minimum spacing and a rolling hourly cap.
 
-    Over-cap alerts are refused rather than queued. A weather alert delivered
-    forty minutes late is worse than useless: the reader has either already
-    seen the weather or acted on a stale picture. Refusing loudly in the log
-    is the honest outcome.
+    Nothing is queued here. A refusal is a refusal, reported to the caller and
+    logged, because a weather alert delivered forty minutes late is worse than
+    useless: the reader has either already seen the weather or acted on a stale
+    picture. What the caller does about a refusal — wait it out, or offer the
+    alert again on the next poll while NWS still lists it as active — is the
+    caller's decision, and this class keeps no backlog of its own either way.
     """
 
     min_interval_seconds: int
@@ -82,11 +85,22 @@ class RateLimiter:
         while self._sent_at and self._sent_at[0] < cutoff:
             self._sent_at.popleft()
 
+    def cap_reached(self, now: datetime) -> bool:
+        """Whether the rolling hourly cap is what blocks the next transmission.
+
+        Callers need to tell the two limits apart because they clear on wildly
+        different timescales. Minimum spacing is seconds and worth waiting out;
+        hourly capacity can be most of an hour away and is not.
+        """
+        self._expire(now)
+
+        return self.max_per_hour > 0 and len(self._sent_at) >= self.max_per_hour
+
     def check(self, now: datetime) -> tuple[bool, str]:
         """Test whether a transmission is allowed, without recording one."""
         self._expire(now)
 
-        if self.max_per_hour > 0 and len(self._sent_at) >= self.max_per_hour:
+        if self.cap_reached(now):
             oldest = self._sent_at[0]
             retry_in = int((oldest + timedelta(hours=1) - now).total_seconds())
             return False, (
@@ -111,17 +125,22 @@ class RateLimiter:
         self._sent_at.append(now)
 
     def seconds_until_ready(self, now: datetime) -> int:
-        """How long until the next transmission would be permitted."""
+        """How long until the next transmission would be permitted.
+
+        Rounded up. A caller that sleeps for this long then asks check() again
+        must find capacity waiting for it, and truncating a 29.5 second wait to
+        29 would send it back round for the remaining half second.
+        """
         self._expire(now)
 
         waits = [0]
 
-        if self.max_per_hour > 0 and len(self._sent_at) >= self.max_per_hour:
+        if self.cap_reached(now):
             oldest = self._sent_at[0]
-            waits.append(int((oldest + timedelta(hours=1) - now).total_seconds()))
+            waits.append(ceil((oldest + timedelta(hours=1) - now).total_seconds()))
 
         if self.min_interval_seconds > 0 and self._sent_at:
             elapsed = (now - self._sent_at[-1]).total_seconds()
-            waits.append(int(self.min_interval_seconds - elapsed))
+            waits.append(ceil(self.min_interval_seconds - elapsed))
 
         return max(waits)

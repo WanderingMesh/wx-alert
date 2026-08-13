@@ -362,6 +362,21 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     mesh.add_argument(
+        "--meshcore-startup-max-age",
+        type=nonnegative_seconds,
+        default=config.meshcore.startup_max_age,
+        metavar="SECONDS",
+        help=(
+            "On the first cycle after start, do not broadcast a product older "
+            "than this. A warning still in force for at least this long is "
+            "broadcast regardless of its age. 0 disables the policy, which is "
+            "what a dry run wants when previewing current alerts. Separate "
+            "from --startup-max-age, which governs ntfy. Configured default: "
+            f"{config.meshcore.startup_max_age}."
+        ),
+    )
+
+    mesh.add_argument(
         "--meshcore-reset",
         action="store_true",
         help=(

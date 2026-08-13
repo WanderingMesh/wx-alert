@@ -272,3 +272,63 @@ class TestReadConfigFile:
         config = load_configuration(read_config_file(path))
         assert config.ntfy_topic is None, "the template must not carry a real topic"
         assert config.ntfy_token is None, "the template must not carry a real token"
+
+
+class TestMeshCoreStartupAgeOverride:
+    """The radio's staleness limit has to be reachable from the command line.
+
+    --startup-max-age governs ntfy only. Documenting it as the way to preview
+    radio output produced a dry run that rendered nothing, because every alert
+    currently active is normally older than the limit.
+    """
+
+    @pytest.fixture
+    def config_file(self, tmp_path):
+        path = tmp_path / "config.ini"
+        path.write_text(
+            textwrap.dedent(
+                MINIMAL
+                + """
+                [meshcore]
+                ENABLED = true
+                PORT = /dev/meshcore
+                STARTUP_MAX_AGE_SECONDS = 900
+                """
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def build_mesh_policy(self, config_file, argv):
+        from wx_alert.__main__ import build_transports
+        from wx_alert.cli import parse_arguments
+
+        args = parse_arguments(["--config", str(config_file), *argv])
+        transports = build_transports(None, args)
+        mesh = next(t for t in transports if t.name == "meshcore")
+        return mesh._startup_policy
+
+    def test_defaults_to_the_configured_limit(self, config_file):
+        policy = self.build_mesh_policy(config_file, ["--meshcore"])
+        assert policy.max_age_seconds == 900
+
+    def test_the_flag_overrides_the_file(self, config_file):
+        policy = self.build_mesh_policy(
+            config_file, ["--meshcore", "--meshcore-startup-max-age", "0"]
+        )
+        assert not policy.enabled
+
+    def test_the_remaining_life_threshold_tracks_the_limit(self, config_file):
+        # One number for an operator to reason about: too old to replay past
+        # the limit, worth the airtime while it has that long left to run.
+        policy = self.build_mesh_policy(
+            config_file, ["--meshcore", "--meshcore-startup-max-age", "1200"]
+        )
+        assert policy.warning_min_remaining_seconds == 1200
+        assert not policy.always_notify_warnings
+
+    def test_the_ntfy_flag_does_not_reach_the_radio(self, config_file):
+        policy = self.build_mesh_policy(
+            config_file, ["--meshcore", "--startup-max-age", "0"]
+        )
+        assert policy.max_age_seconds == 900
