@@ -9,10 +9,12 @@ import pytest
 from wx_alert.nws import (
     alert_age_seconds,
     alert_fingerprint,
+    alert_geometry,
     alert_identity,
     alert_sent_time,
     classify_event,
     format_age,
+    get_active_alerts,
     parse_nws_datetime,
 )
 
@@ -133,3 +135,87 @@ class TestIdentityAndFingerprint:
     def test_fingerprint_is_stable_across_key_order(self, flood_watch):
         reordered = dict(reversed(list(flood_watch.items())))
         assert alert_fingerprint(reordered) == alert_fingerprint(flood_watch)
+
+
+class RecordingSession:
+    """Captures the outgoing query so the request itself can be asserted on."""
+
+    def __init__(self, features):
+        self.features = features
+        self.params = None
+
+    def get(self, url, params=None, **kwargs):
+        self.params = params
+        session = self
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"features": session.features}
+
+        return Response()
+
+
+class TestActiveAlertQuery:
+    def test_queries_by_zone_rather_than_point(self):
+        # A point query intersects the coordinate with each alert's polygon,
+        # which excludes every storm-based warning that does not happen to
+        # cover that exact spot. This is the bug the 1.2.0 work fixes.
+        session = RecordingSession([])
+        get_active_alerts(session, ["NVC031"])
+
+        assert session.params == {"zone": "NVC031"}
+        assert "point" not in session.params
+
+    def test_sends_a_county_code_not_a_forecast_zone(self):
+        # Regression guard. NVZ003 is accepted by the API and returns only
+        # zone products, so tornado warnings would stop arriving silently.
+        session = RecordingSession([])
+        get_active_alerts(session, ["NVC031", "NVC029"])
+
+        zones = session.params["zone"].split(",")
+        assert any(zone[2] == "C" for zone in zones)
+
+    def test_joins_several_zones_into_one_request(self):
+        session = RecordingSession([])
+        get_active_alerts(session, ["NVC031", "NVC029", "NVC019"])
+
+        assert session.params == {"zone": "NVC031,NVC029,NVC019"}
+
+    def test_an_empty_zone_list_is_refused(self):
+        # Querying nothing returns nothing, which would look exactly like
+        # quiet weather for as long as the container ran.
+        with pytest.raises(ValueError, match="at least one"):
+            get_active_alerts(RecordingSession([]), [])
+
+    def test_geometry_is_carried_alongside_the_properties(self):
+        geometry = {"type": "Polygon", "coordinates": [[[-119.0, 39.0]]]}
+        session = RecordingSession(
+            [{"properties": {"event": "Tornado Warning"}, "geometry": geometry}]
+        )
+
+        alerts = get_active_alerts(session, ["NVC031"])
+
+        assert alert_geometry(alerts[0]) == geometry
+
+    def test_a_zone_product_reports_no_geometry(self):
+        session = RecordingSession(
+            [{"properties": {"event": "Flood Watch"}, "geometry": None}]
+        )
+
+        alerts = get_active_alerts(session, ["NVC031"])
+
+        assert alert_geometry(alerts[0]) is None
+
+    def test_malformed_features_are_skipped(self):
+        session = RecordingSession(
+            ["not a dict", {"properties": None}, {"properties": {"event": "X"}}]
+        )
+
+        assert len(get_active_alerts(session, ["NVC031"])) == 1
+
+    def test_a_non_list_features_value_is_rejected(self):
+        with pytest.raises(ValueError, match="features"):
+            get_active_alerts(RecordingSession({"unexpected": True}), ["NVC031"])

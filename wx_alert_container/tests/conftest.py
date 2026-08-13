@@ -37,6 +37,27 @@ def flood_watch() -> dict[str, Any]:
 
 
 @pytest.fixture
+def tornado_warning() -> dict[str, Any]:
+    """The real Tornado Warning that exposed the point-query bug.
+
+    Issued by NWS Reno on 2026-08-13 for Lyon, Storey, and Washoe counties.
+    Its polygon lies east of Reno, so a point query at the monitored
+    coordinate returned nothing while the warning was active and the radio
+    stayed silent. Captured in the flattened form get_active_alerts produces,
+    with the GeoJSON geometry folded in beside the properties.
+    """
+    alerts = json.loads(
+        (FIXTURE_DIR / "nws_reno_tornado_warning.json").read_text(encoding="utf-8")
+    )
+    return alerts[0]
+
+
+# The monitored point in the deployment that missed the warning above.
+RENO_LATITUDE = 39.5296
+RENO_LONGITUDE = -119.8138
+
+
+@pytest.fixture
 def fresh_warning(now: datetime) -> dict[str, Any]:
     """A warning issued a minute ago, which every policy should let through."""
     issued = now - timedelta(minutes=1)

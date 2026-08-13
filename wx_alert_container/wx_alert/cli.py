@@ -23,8 +23,10 @@ from .config import (
     validate_latitude,
     validate_longitude,
     validate_nonnegative,
+    validate_radius_km,
 )
 from .text import clean_optional
+from .zones import parse_zone_list
 
 LOGGER = logging.getLogger("wx-alert")
 
@@ -69,6 +71,14 @@ def nonnegative_seconds(value: str) -> int:
     return _argparse_wrapper(
         lambda v: validate_nonnegative(int(v), "value")
     )(value)
+
+
+def zone_list(value: str) -> tuple[str, ...]:
+    return _argparse_wrapper(lambda v: parse_zone_list(v, "zones"))(value)
+
+
+def radius_km(value: str) -> float:
+    return _argparse_wrapper(lambda v: validate_radius_km(float(v)))(value)
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -154,6 +164,34 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default=config.longitude,
         metavar="LONGITUDE",
         help=f"Longitude to monitor. Configured default: {config.longitude}",
+    )
+
+    parser.add_argument(
+        "--zones",
+        type=zone_list,
+        default=config.zones,
+        metavar="UGC[,UGC...]",
+        help=(
+            "Additional NWS UGC zones to query alongside the county "
+            "containing the monitored point, which is resolved automatically. "
+            "Use county codes such as NVC031 for neighbouring counties a "
+            "wide-area mesh reaches into. Configured default: "
+            f"{','.join(config.zones) or 'none'}."
+        ),
+    )
+
+    parser.add_argument(
+        "--alert-radius-km",
+        type=radius_km,
+        default=config.alert_radius_km,
+        metavar="KM",
+        help=(
+            "Discard a polygon warning whose warned area is farther than "
+            "this from the monitored point. Alerts issued to a whole zone "
+            "carry no polygon and are always kept. 0 disables the test and "
+            "keeps everything in the queried counties. Configured default: "
+            f"{config.alert_radius_km:g}."
+        ),
     )
 
     parser.add_argument(

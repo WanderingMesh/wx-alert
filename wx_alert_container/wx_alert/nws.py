@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 import requests
 
 from .text import clean_field, clean_optional
 
 NWS_API_URL = "https://api.weather.gov/alerts/active"
+
+# Where the alert's GeoJSON geometry is stashed on the flattened record.
+GEOMETRY_KEY = "geometry"
 
 # NWS asks every client to identify itself with a real, monitored contact
 # address so they can reach operators of misbehaving clients.
@@ -47,13 +50,26 @@ SEVERITY_RANK = {
 
 def get_active_alerts(
     session: requests.Session,
-    latitude: float,
-    longitude: float,
+    zones: Sequence[str],
 ) -> list[dict[str, Any]]:
-    """Retrieve active NWS alerts covering the supplied coordinate."""
+    """Retrieve active NWS alerts for the supplied UGC zones.
+
+    Queried by zone rather than by point. A point query intersects the
+    coordinate with each alert's polygon, which excludes every storm-based
+    warning whose polygon does not cover that exact spot; a county query
+    returns polygon warnings and zone products alike. See zones.py.
+
+    The GeoJSON geometry is folded into each alert record so the caller can
+    measure how far the warned area actually is. NWS puts geometry beside
+    properties rather than inside it, and nothing in the NWS property set uses
+    this name, so there is no field to collide with.
+    """
+    if not zones:
+        raise ValueError("at least one NWS zone is required")
+
     response = session.get(
         NWS_API_URL,
-        params={"point": f"{latitude:.4f},{longitude:.4f}"},
+        params={"zone": ",".join(zones)},
         headers=NWS_HEADERS,
         timeout=20,
     )
@@ -74,6 +90,7 @@ def get_active_alerts(
         properties = feature.get("properties", {})
 
         if isinstance(properties, dict):
+            properties[GEOMETRY_KEY] = feature.get("geometry")
             alerts.append(properties)
 
     return alerts
@@ -196,6 +213,15 @@ def alert_severity_rank(alert: dict[str, Any]) -> int:
     """Return the CAP severity of an alert as a comparable rank."""
     severity = clean_field(alert.get("severity"), "Unknown").casefold()
     return SEVERITY_RANK.get(severity, 0)
+
+
+def alert_geometry(alert: dict[str, Any]) -> Any:
+    """Return the alert's GeoJSON geometry, or None for a zone product.
+
+    Absence is meaningful rather than exceptional: watches, advisories, and
+    special weather statements are issued to whole zones and carry no polygon.
+    """
+    return alert.get(GEOMETRY_KEY)
 
 
 def alert_identity(alert: dict[str, Any]) -> str:

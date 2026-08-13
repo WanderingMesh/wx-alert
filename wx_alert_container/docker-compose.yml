@@ -13,7 +13,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: wx-alert:1.1.0
+    image: wx-alert:1.2.0
     container_name: wx-alert
 
     # Restart on failure is what recovers a replugged USB radio. The program
