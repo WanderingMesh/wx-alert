@@ -19,6 +19,7 @@ from .state import StateError, load_state
 from .transports.base import Transport, TransportError
 from .transports.meshcore import MeshCoreTransport
 from .transports.ntfy import NtfyTransport
+from .zones import ZoneResolutionError, determine_zones, zone_cache_path
 
 LOGGER = logging.getLogger("wx-alert")
 
@@ -81,12 +82,20 @@ def build_transports(
                     max_per_hour=mesh.max_per_hour,
                 ),
                 startup_policy=StartupPolicy(
-                    max_age_seconds=mesh.startup_max_age,
-                    # The warning bypass is deliberately not applied to the
-                    # radio. On ntfy a duplicate costs nothing; on a shared
-                    # channel, replaying hours-old warnings after a restart
-                    # costs everyone airtime.
+                    max_age_seconds=args.meshcore_startup_max_age,
+                    # ntfy's unconditional warning bypass is deliberately not
+                    # applied to the radio: a duplicate push costs nothing,
+                    # while replaying every hours-old warning after a restart
+                    # costs everyone on the channel airtime.
                     always_notify_warnings=False,
+                    # Instead the radio asks how much life a warning has left.
+                    # Reusing the staleness limit as the threshold keeps this
+                    # to one number an operator has to reason about: a warning
+                    # is too old to replay after the limit has passed, and
+                    # worth the airtime while it has at least that long left to
+                    # run. The two together suppress an expiring warning from
+                    # the backlog without suppressing an active one.
+                    warning_min_remaining_seconds=args.meshcore_startup_max_age,
                 ),
                 connect_timeout=mesh.connect_timeout,
                 send_timeout=mesh.send_timeout,
@@ -155,6 +164,29 @@ def main(argv: list[str] | None = None) -> int:
             # would re-deliver every currently active alert.
             LOGGER.error("Persistent state initialization failed error=%s", exc)
             return STATUS_STATE_FAILURE
+
+        try:
+            args.query_zones = determine_zones(
+                session,
+                latitude=args.latitude,
+                longitude=args.longitude,
+                extra_zones=args.zones,
+                cache_path=zone_cache_path(args.state_file),
+            )
+        except ZoneResolutionError as exc:
+            # Refuse to start rather than query nothing. An empty zone list
+            # returns an empty alert list, so the program would report "no
+            # active alerts" forever while the weather did as it pleased.
+            LOGGER.error("Could not determine which NWS zones to query: %s", exc)
+            return STATUS_STATE_FAILURE
+
+        LOGGER.info(
+            "Monitoring zones=%s radius=%gkm point=%.4f,%.4f",
+            ",".join(args.query_zones),
+            args.alert_radius_km,
+            args.latitude,
+            args.longitude,
+        )
 
         started: list[Transport] = []
         try:

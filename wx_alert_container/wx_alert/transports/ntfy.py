@@ -137,6 +137,7 @@ class NtfyTransport:
             self._startup_policy,
             context.first_cycle,
             context.now,
+            previously_handled=context.previously_handled,
         )
         if suppress:
             return DeliveryResult.SKIPPED, f"startup-stale: {reason}"

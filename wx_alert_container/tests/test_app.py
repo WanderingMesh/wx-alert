@@ -6,10 +6,13 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from conftest import RENO_LATITUDE, RENO_LONGITUDE
 
 from wx_alert.app import (
     CONSOLE_TRANSPORT_NAME,
     deliver_alert,
+    filter_by_proximity,
+    prioritize,
     process_alerts,
     settlement_names,
 )
@@ -58,6 +61,95 @@ def context(now):
     return DeliveryContext(first_cycle=False, now=now)
 
 
+def keep(alerts):
+    return [alert["event"] for alert in alerts]
+
+
+class TestProximityFilter:
+    """Fetching by county is broad; this is what restores local relevance."""
+
+    def test_keeps_a_nearby_warning(self, tornado_warning):
+        # The alert this whole change exists to deliver: about 15 km east of
+        # the monitored point, outside the polygon, well inside mesh range.
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 50
+        )
+        assert keep(kept) == ["Tornado Warning"]
+
+    def test_drops_the_same_warning_under_a_tight_radius(self, tornado_warning):
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 5
+        )
+        assert kept == []
+
+    def test_keeps_a_zone_product_that_has_no_polygon(self, flood_watch):
+        # NWS already scoped it to the queried county. There is no geometry
+        # to be far away, and dropping it would silence every watch.
+        assert "geometry" not in flood_watch
+
+        kept = filter_by_proximity(
+            [flood_watch], RENO_LATITUDE, RENO_LONGITUDE, 1
+        )
+        assert keep(kept) == ["Flood Watch"]
+
+    def test_a_zero_radius_disables_the_test(self, tornado_warning):
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 0
+        )
+        assert keep(kept) == ["Tornado Warning"]
+
+    def test_a_far_county_is_excluded(self, tornado_warning):
+        # Washoe County runs 315 km north to the Oregon border. Without this,
+        # a county query would put warnings from Gerlach on the radio.
+        gerlach_latitude, gerlach_longitude = 40.6555, -119.3560
+
+        kept = filter_by_proximity(
+            [tornado_warning], gerlach_latitude, gerlach_longitude, 50
+        )
+        assert kept == []
+
+    def test_preserves_order_and_identity(self, tornado_warning, flood_watch):
+        alerts = [flood_watch, tornado_warning]
+        kept = filter_by_proximity(alerts, RENO_LATITUDE, RENO_LONGITUDE, 50)
+
+        assert keep(kept) == ["Flood Watch", "Tornado Warning"]
+        assert kept[1] is tornado_warning
+
+
+class TestPrioritize:
+    """Scarce airtime has to go to the worst event, not the first-listed one."""
+
+    def test_orders_a_batch_loudest_first(self, tornado_warning, flood_watch):
+        statement = dict(flood_watch, event="Special Weather Statement")
+        advisory = dict(flood_watch, event="Wind Advisory")
+
+        ordered = prioritize([statement, flood_watch, advisory, tornado_warning])
+
+        assert keep(ordered) == [
+            "Tornado Warning",
+            "Flood Watch",
+            "Wind Advisory",
+            "Special Weather Statement",
+        ]
+
+    def test_severity_breaks_ties_within_a_class(self, fresh_warning):
+        moderate = dict(fresh_warning, event="Winter Storm Warning",
+                        severity="Moderate")
+        extreme = dict(fresh_warning, event="Tornado Warning", severity="Extreme")
+
+        ordered = prioritize([moderate, extreme])
+
+        assert keep(ordered) == ["Tornado Warning", "Winter Storm Warning"]
+
+    def test_equal_rank_keeps_the_order_nws_gave(self, fresh_warning):
+        first = dict(fresh_warning, areaDesc="Washoe")
+        second = dict(fresh_warning, areaDesc="Storey")
+
+        ordered = prioritize([first, second])
+
+        assert [alert["areaDesc"] for alert in ordered] == ["Washoe", "Storey"]
+
+
 class TestSettlementNames:
     def test_uses_transport_names(self):
         transports = [RecordingTransport("ntfy"), RecordingTransport("meshcore")]
@@ -84,6 +176,41 @@ class TestDeliverAlert:
 
         deliver_alert(flood_watch, [transport], state, context)
         assert state.is_settled(flood_watch, "meshcore")
+
+    def test_does_not_record_a_deferral(self, flood_watch, context):
+        # The bug this fixes: a radio that declined an alert for thirty
+        # seconds of airtime spacing had it recorded as handled, so the alert
+        # was never offered again and never went out at all.
+        state = AlertState()
+        transport = RecordingTransport(
+            "meshcore", DeliveryResult.DEFERRED, "rate-limit: spacing"
+        )
+
+        deliver_alert(flood_watch, [transport], state, context)
+        assert not state.is_settled(flood_watch, "meshcore")
+
+    def test_a_deferral_is_not_a_failure(self, flood_watch, context):
+        # Counting it would eventually trip EXIT_AFTER_FAILED_CYCLES and
+        # restart the container over a full airtime budget.
+        state = AlertState()
+        transport = RecordingTransport(
+            "meshcore", DeliveryResult.DEFERRED, "rate-limit: hourly cap"
+        )
+        failed: set[str] = set()
+
+        assert deliver_alert(flood_watch, [transport], state, context, failed) == 0
+        assert failed == set()
+
+    def test_a_deferred_alert_is_offered_again(self, flood_watch, context):
+        state = AlertState()
+        transport = RecordingTransport(
+            "meshcore", DeliveryResult.DEFERRED, "rate-limit: hourly cap"
+        )
+
+        for _ in range(3):
+            deliver_alert(flood_watch, [transport], state, context)
+
+        assert len(transport.delivered) == 3
 
     def test_leaves_a_failure_unsettled(self, flood_watch, context):
         state = AlertState()

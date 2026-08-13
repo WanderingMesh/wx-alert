@@ -9,11 +9,15 @@ from typing import Any, Sequence
 import requests
 
 from .formatting import build_compact_stdout_message, build_verbose_message
+from .geo import geometry_distance_km
 from .health import heartbeat_path, write_heartbeat
 from .nws import (
+    EVENT_CLASS_RANK,
     alert_age_seconds,
     alert_class,
+    alert_geometry,
     alert_sent_time,
+    alert_severity_rank,
     format_age,
     get_active_alerts,
 )
@@ -44,22 +48,17 @@ def settlement_names(transports: Sequence[Transport]) -> list[str]:
 
 def fetch_alerts(
     session: requests.Session,
-    latitude: float,
-    longitude: float,
+    zones: Sequence[str],
 ) -> list[dict[str, Any]] | None:
     """Query NWS, logging and absorbing every expected failure mode.
 
     Returns None when the query failed. An empty list is a valid result
     meaning "no active alerts", which is why None is used for failure.
     """
-    LOGGER.info(
-        "Querying NWS active alerts latitude=%.5f longitude=%.5f",
-        latitude,
-        longitude,
-    )
+    LOGGER.info("Querying NWS active alerts zones=%s", ",".join(zones))
 
     try:
-        return get_active_alerts(session, latitude, longitude)
+        return get_active_alerts(session, zones)
     except requests.Timeout:
         LOGGER.error("NWS API request timed out")
     except requests.HTTPError as exc:
@@ -79,6 +78,67 @@ def fetch_alerts(
         LOGGER.error("NWS returned invalid JSON error=%s", exc)
 
     return None
+
+
+def filter_by_proximity(
+    alerts: list[dict[str, Any]],
+    latitude: float,
+    longitude: float,
+    radius_km: float,
+) -> list[dict[str, Any]]:
+    """Drop polygon warnings whose warned area is too far to be relevant.
+
+    Alerts are fetched by county because that is the only query form that
+    returns storm-based warnings at all, but a county can be 300 km long. This
+    restores local relevance without narrowing the fetch.
+
+    An alert with no polygon is kept unconditionally. Watches, advisories, and
+    statements are issued to a whole zone, so NWS has already decided they
+    apply to the queried county; there is no geometry to be far away.
+    """
+    if radius_km <= 0:
+        return alerts
+
+    kept: list[dict[str, Any]] = []
+
+    for alert in alerts:
+        distance = geometry_distance_km(alert_geometry(alert), latitude, longitude)
+
+        if distance is None or distance <= radius_km:
+            kept.append(alert)
+            continue
+
+        LOGGER.info(
+            "Alert is outside the monitored radius event=%r distance=%.1fkm "
+            "radius=%.1fkm area=%r",
+            clean_field(alert.get("event"), "Unknown weather alert"),
+            distance,
+            radius_km,
+            clean_field(alert.get("areaDesc"), "unknown area"),
+        )
+
+    return kept
+
+
+def prioritize(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order alerts loudest first, by product class then CAP severity.
+
+    NWS returns active alerts in no particular order of importance, and a
+    county query returns several at once. Anything downstream that runs out of
+    budget mid-batch — the radio's hourly cap, or a cycle cut short by a
+    shutdown — therefore used to spend what it had on whichever product
+    happened to be listed first. A Special Weather Statement could consume the
+    airtime that a Tornado Warning in the same response needed.
+
+    Python's sort is stable, so alerts of equal rank keep the order NWS gave.
+    """
+    return sorted(
+        alerts,
+        key=lambda alert: (
+            -EVENT_CLASS_RANK[alert_class(alert)],
+            -alert_severity_rank(alert),
+        ),
+    )
 
 
 def deliver_alert(
@@ -111,7 +171,13 @@ def deliver_alert(
             continue
 
         try:
-            result, detail = transport.deliver(alert, context)
+            result, detail = transport.deliver(
+                alert,
+                # Whether this transport has had a turn at this alert before is
+                # what lets its startup staleness policy tell a cold-start
+                # backlog from a retry after a failure.
+                context.for_transport(state.has_record(alert, transport.name)),
+            )
         except Exception as exc:  # noqa: BLE001 - a transport bug must not
             # take down the poller; the alert simply stays eligible for retry.
             failures += 1
@@ -143,6 +209,21 @@ def deliver_alert(
                 detail,
             )
             state.record(alert, transport.name, f"skipped:{detail}")
+        elif result is DeliveryResult.DEFERRED:
+            # Deliberately not recorded, and deliberately not a failure. The
+            # transport would have carried this alert but could not right now,
+            # for a reason that clears without intervention, so it stays
+            # outstanding and is offered again next cycle. Recording it would
+            # retire the alert over a condition that has already passed;
+            # counting it as a failure would eventually restart the container
+            # over one that was never an error.
+            LOGGER.warning(
+                "Delivery deferred to the next cycle transport=%s event=%r "
+                "reason=%s",
+                transport.name,
+                event,
+                detail,
+            )
         else:
             failures += 1
             if failed_transports is not None:
@@ -234,9 +315,18 @@ def perform_alert_check(
     failed_transports: set[str] | None = None,
 ) -> int:
     """Perform one NWS query and deliver whatever is outstanding."""
-    alerts = fetch_alerts(session, args.latitude, args.longitude)
+    alerts = fetch_alerts(session, args.query_zones)
     if alerts is None:
         return STATUS_SOURCE_FAILURE
+
+    # Filtered before deduplication, so a distant warning is never recorded as
+    # handled. If the storm moves closer on a later cycle it is still new work.
+    alerts = filter_by_proximity(
+        alerts,
+        args.latitude,
+        args.longitude,
+        args.alert_radius_km,
+    )
 
     removed = prune_state(state, args.state_retention_days)
     if removed:
@@ -245,13 +335,17 @@ def perform_alert_check(
     context = DeliveryContext.create(first_cycle=first_cycle)
 
     # An alert is outstanding while any enabled transport has yet to reach a
-    # terminal outcome for this exact version of it.
+    # terminal outcome for this exact version of it. Ordered loudest first, so
+    # a transport that runs out of airtime part way through a batch spends what
+    # it had on the most urgent products rather than the earliest-listed ones.
     names = settlement_names(transports)
-    outstanding = [
-        alert
-        for alert in alerts
-        if any(not state.is_settled(alert, name) for name in names)
-    ]
+    outstanding = prioritize(
+        [
+            alert
+            for alert in alerts
+            if any(not state.is_settled(alert, name) for name in names)
+        ]
+    )
 
     LOGGER.info(
         "NWS returned %d active alert(s); %d outstanding; %d already handled",

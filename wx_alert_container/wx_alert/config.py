@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from .nws import EVENT_CLASS_RANK, SEVERITY_RANK
 from .state import DEFAULT_RETENTION_DAYS, DEFAULT_STATE_FILE
 from .text import clean_optional
+from .zones import parse_zone_list
 
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 DEFAULT_NTFY_TAGS = "weather"
@@ -24,6 +25,14 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 3600
 DEFAULT_STARTUP_MAX_AGE_SECONDS = 900
 DEFAULT_ALWAYS_NOTIFY_WARNINGS = True
 DEFAULT_EXIT_AFTER_FAILED_CYCLES = 10
+
+# Alerts are fetched by county, and counties are not a uniform size: Washoe NV
+# is 315 km end to end while Arlington VA is 12 km across. This radius is what
+# makes the fetch scope irrelevant, keeping a warning only when its polygon
+# comes near the monitored point. 50 km is a generous mesh footprint without
+# reaching the far end of a large western county.
+DEFAULT_ALERT_RADIUS_KM = 50.0
+MAX_ALERT_RADIUS_KM = 1000.0
 
 # MeshCore defaults are deliberately conservative. Airtime on a shared LoRa
 # channel is a common resource, so the out-of-box behavior carries only
@@ -96,6 +105,8 @@ class MeshCoreConfiguration:
 class FileConfiguration:
     latitude: float
     longitude: float
+    zones: tuple[str, ...]
+    alert_radius_km: float
     ntfy_topic: str | None
     ntfy_server: str
     ntfy_token: str | None
@@ -146,6 +157,16 @@ def validate_latitude(value: float, source: str = "latitude") -> float:
 def validate_longitude(value: float, source: str = "longitude") -> float:
     if not -180 <= value <= 180:
         raise ConfigurationError(f"{source} must be between -180 and 180")
+    return value
+
+
+def validate_radius_km(value: float, source: str = "alert radius") -> float:
+    """Zero is valid and disables the distance test, keeping the whole county."""
+    if not 0 <= value <= MAX_ALERT_RADIUS_KM:
+        raise ConfigurationError(
+            f"{source} must be between 0 and {MAX_ALERT_RADIUS_KM:.0f} km; "
+            "0 disables the distance test"
+        )
     return value
 
 
@@ -354,6 +375,20 @@ def _read_int(
         ) from exc
 
 
+def _read_float(
+    parser: configparser.ConfigParser,
+    section: str,
+    option: str,
+    fallback: float,
+) -> float:
+    try:
+        return parser.getfloat(section, option, fallback=fallback)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"[{section}] {option} must be a number"
+        ) from exc
+
+
 def _read_bool(
     parser: configparser.ConfigParser,
     section: str,
@@ -398,6 +433,26 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
     longitude = validate_longitude(
         _read_required_float(parser, "weather", "DEFAULT_LONGITUDE"),
         "[weather] DEFAULT_LONGITUDE",
+    )
+
+    # Optional. The county containing the point above is always queried; this
+    # adds the neighbouring counties a wide-area mesh reaches into.
+    try:
+        zones = parse_zone_list(
+            parser.get("weather", "ZONES", fallback=""),
+            "[weather] ZONES",
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+    alert_radius_km = validate_radius_km(
+        _read_float(
+            parser,
+            "weather",
+            "ALERT_RADIUS_KM",
+            DEFAULT_ALERT_RADIUS_KM,
+        ),
+        "[weather] ALERT_RADIUS_KM",
     )
 
     topic = clean_optional(parser.get("ntfy", "TOPIC", fallback=""))
@@ -476,6 +531,8 @@ def load_configuration(parser: configparser.ConfigParser) -> FileConfiguration:
     return FileConfiguration(
         latitude=latitude,
         longitude=longitude,
+        zones=zones,
+        alert_radius_km=alert_radius_km,
         ntfy_topic=topic,
         ntfy_server=server,
         ntfy_token=token,

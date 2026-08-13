@@ -8,12 +8,15 @@ the gate ordering, and reconnection after a failure.
 
 from __future__ import annotations
 
+import argparse
 from datetime import timedelta
 
 import pytest
 
+from wx_alert.app import prioritize, process_alerts
 from wx_alert.policy import StartupPolicy
 from wx_alert.ratelimit import RateLimiter, RelevanceFilter
+from wx_alert.state import AlertState
 from wx_alert.transports.base import DeliveryContext, DeliveryResult, TransportError
 
 
@@ -71,8 +74,42 @@ def radio():
     return FakeRadio()
 
 
+class FakeClock:
+    """A clock the transport reads and a wait the test does not sit through.
+
+    The transport meters airtime against real time, so without this a test of
+    a 60 second transmission gap would take 60 seconds. Waiting advances the
+    clock instead of blocking, which is also the only way to assert that the
+    transport waited rather than gave up.
+    """
+
+    def __init__(self, start):
+        self.now = start
+        self.waits: list[float] = []
+        self.interrupted = False
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+    def sleep(self, seconds: float) -> bool:
+        """Stand in for STOP_EVENT.wait, returning True when interrupted."""
+        self.waits.append(seconds)
+        if self.interrupted:
+            return True
+        self.advance(seconds)
+        return False
+
+
 @pytest.fixture
-def make_transport(radio, monkeypatch):
+def clock(now):
+    return FakeClock(now)
+
+
+@pytest.fixture
+def make_transport(radio, clock, monkeypatch):
     """Build a MeshCoreTransport wired to the fake radio."""
     import types
 
@@ -102,6 +139,8 @@ def make_transport(radio, monkeypatch):
             "relevance": RelevanceFilter("warning", "severe"),
             "rate_limiter": RateLimiter(0, 0),
             "startup_policy": StartupPolicy(0, always_notify_warnings=False),
+            "clock": clock,
+            "sleep": clock.sleep,
         }
         settings.update(overrides)
         transport = MeshCoreTransport(**settings)
@@ -266,36 +305,125 @@ class TestMeshCoreDelivery:
 
         assert result is DeliveryResult.SENT
 
-    def test_respects_the_rate_limiter(self, make_transport, radio,
-                                       fresh_warning, now):
+    def test_waits_out_spacing_so_a_whole_batch_goes_out(
+        self, make_transport, radio, fresh_warning, now, clock
+    ):
+        # A county query returns several alerts at once. Refusing every one
+        # after the first would put a single alert per poll interval on the
+        # air, and the rest were being recorded as handled and lost outright.
         transport = make_transport(
-            rate_limiter=RateLimiter(min_interval_seconds=60, max_per_hour=0)
+            rate_limiter=RateLimiter(min_interval_seconds=30, max_per_hour=0)
         )
         transport.start()
 
         first, _ = transport.deliver(fresh_warning, DeliveryContext(False, now))
-        second, detail = transport.deliver(
+        second, _ = transport.deliver(
             dict(fresh_warning, id="urn:oid:second"),
-            DeliveryContext(False, now + timedelta(seconds=5)),
+            DeliveryContext(False, now),
         )
 
         assert first is DeliveryResult.SENT
-        assert second is DeliveryResult.SKIPPED
+        assert second is DeliveryResult.SENT
+        assert len(radio.sent) == 2
+        # Held for the configured gap rather than transmitting back to back.
+        assert clock.waits == [30]
+
+    def test_the_cycle_timestamp_does_not_govern_spacing(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        # DeliveryContext.now is stamped once per cycle, so every alert in a
+        # batch carries the same value. Metering against it reads zero elapsed
+        # time between transmissions and refuses everything after the first.
+        transport = make_transport(
+            rate_limiter=RateLimiter(min_interval_seconds=1, max_per_hour=0)
+        )
+        transport.start()
+
+        for index in range(4):
+            result, _ = transport.deliver(
+                dict(fresh_warning, id=f"urn:oid:{index}"),
+                DeliveryContext(False, now),
+            )
+            assert result is DeliveryResult.SENT
+
+        assert len(radio.sent) == 4
+
+    def test_defers_rather_than_holding_the_cycle_open_too_long(
+        self, make_transport, radio, fresh_warning, now, clock
+    ):
+        # Waiting is right for a 30 second gap and wrong for a ten minute one:
+        # it would stall the next NWS query and every alert behind this one.
+        transport = make_transport(
+            rate_limiter=RateLimiter(min_interval_seconds=600, max_per_hour=0)
+        )
+        transport.start()
+
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+        result, detail = transport.deliver(
+            dict(fresh_warning, id="urn:oid:second"),
+            DeliveryContext(False, now),
+        )
+
+        assert result is DeliveryResult.DEFERRED
         assert "rate-limit" in detail
+        assert clock.waits == []
         assert len(radio.sent) == 1
 
-    def test_a_skip_does_not_consume_airtime_budget(self, make_transport, radio,
-                                                    fresh_warning, now):
-        limiter = RateLimiter(min_interval_seconds=60, max_per_hour=0)
+    def test_the_hourly_cap_defers_instead_of_waiting(
+        self, make_transport, radio, fresh_warning, now, clock
+    ):
+        # Capacity can be nearly an hour away, which is far too long to hold a
+        # poll cycle open for. The alert is offered again next cycle instead.
+        transport = make_transport(
+            rate_limiter=RateLimiter(min_interval_seconds=0, max_per_hour=1)
+        )
+        transport.start()
+
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+        result, detail = transport.deliver(
+            dict(fresh_warning, id="urn:oid:second"),
+            DeliveryContext(False, now),
+        )
+
+        assert result is DeliveryResult.DEFERRED
+        assert "hourly cap" in detail
+        assert clock.waits == []
+
+    def test_a_shutdown_during_a_spacing_wait_defers(
+        self, make_transport, radio, fresh_warning, now, clock
+    ):
+        # The alert stays outstanding for whoever starts next rather than being
+        # written off because the container was asked to stop mid-gap.
+        transport = make_transport(
+            rate_limiter=RateLimiter(min_interval_seconds=30, max_per_hour=0)
+        )
+        transport.start()
+
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+        clock.interrupted = True
+
+        result, detail = transport.deliver(
+            dict(fresh_warning, id="urn:oid:second"),
+            DeliveryContext(False, now),
+        )
+
+        assert result is DeliveryResult.DEFERRED
+        assert "shutdown" in detail
+        assert len(radio.sent) == 1
+
+    def test_a_refusal_does_not_consume_airtime_budget(
+        self, make_transport, radio, fresh_warning, now, clock
+    ):
+        limiter = RateLimiter(min_interval_seconds=0, max_per_hour=1)
         transport = make_transport(rate_limiter=limiter)
         transport.start()
 
         transport.deliver(fresh_warning, DeliveryContext(False, now))
         transport.deliver(fresh_warning, DeliveryContext(False, now))
 
-        # The second attempt was refused, so capacity returns 60s after the
-        # first transmission rather than 60s after the refusal.
-        assert limiter.seconds_until_ready(now + timedelta(seconds=61)) == 0
+        # Capacity returns an hour after the transmission that actually
+        # happened, not an hour after the attempt that was refused.
+        assert limiter.seconds_until_ready(now + timedelta(hours=1)) == 0
 
     def test_dry_run_records_the_send_without_transmitting(
         self, make_transport, radio, fresh_warning, now
@@ -310,6 +438,243 @@ class TestMeshCoreDelivery:
         assert result is DeliveryResult.SENT
         assert "dry-run" in detail
         assert radio.sent == []
+
+
+class TestMeshCoreStartupStaleness:
+    """What the radio does with alerts that were already active at boot.
+
+    The gate exists so a restart does not replay a backlog onto a shared
+    channel. Suppression here is terminal, so every one of these decisions is
+    final and there is no later cycle to correct it.
+    """
+
+    @pytest.fixture
+    def policy(self):
+        # As __main__ wires it: no unconditional warning bypass, and a warning
+        # earns its airtime by still having time left to run.
+        return StartupPolicy(
+            900,
+            always_notify_warnings=False,
+            warning_min_remaining_seconds=900,
+        )
+
+    @pytest.fixture
+    def old_warning(self, fresh_warning, now):
+        """A warning issued four hours ago and in force for three more."""
+        issued = now - timedelta(hours=4)
+        return dict(fresh_warning, sent=issued.isoformat(),
+                    effective=issued.isoformat())
+
+    def test_a_stale_warning_still_in_force_is_broadcast(
+        self, make_transport, radio, old_warning, now, policy
+    ):
+        # The failure this fixes: a warning issued before the container came up
+        # and still running was suppressed on the first cycle, recorded as
+        # handled, and never reconsidered. Age says it is old news; the three
+        # hours it has left to run say it is the most important thing happening.
+        transport = make_transport(startup_policy=policy)
+        transport.start()
+
+        result, _ = transport.deliver(old_warning, DeliveryContext(True, now))
+
+        assert result is DeliveryResult.SENT
+
+    def test_a_stale_warning_about_to_expire_is_suppressed(
+        self, make_transport, radio, old_warning, now, policy
+    ):
+        # Nothing to act on, so it is not worth the airtime.
+        expiring = dict(
+            old_warning,
+            expires=(now + timedelta(minutes=2)).isoformat(),
+            ends=(now + timedelta(minutes=2)).isoformat(),
+        )
+        transport = make_transport(startup_policy=policy)
+        transport.start()
+
+        result, detail = transport.deliver(expiring, DeliveryContext(True, now))
+
+        assert result is DeliveryResult.SKIPPED
+        assert "startup-stale" in detail
+        assert radio.sent == []
+
+    def test_an_alert_this_transport_already_handled_is_not_stale(
+        self, make_transport, radio, flood_watch, now, policy
+    ):
+        # State proves the radio already had a turn at this alert, so it is not
+        # part of a cold-start backlog: either NWS reissued it, or the previous
+        # attempt failed and this is the retry.
+        transport = make_transport(
+            startup_policy=policy,
+            relevance=RelevanceFilter("watch", "unknown"),
+        )
+        transport.start()
+
+        result, _ = transport.deliver(
+            flood_watch,
+            DeliveryContext(True, now, previously_handled=True),
+        )
+
+        assert result is DeliveryResult.SENT
+
+    def test_a_stale_zone_product_is_still_suppressed(
+        self, make_transport, radio, flood_watch, now, policy
+    ):
+        # The remaining-life bypass is for warnings only. A watch issued hours
+        # ago is exactly the backlog this gate exists to keep off the air.
+        transport = make_transport(
+            startup_policy=policy,
+            relevance=RelevanceFilter("watch", "unknown"),
+        )
+        transport.start()
+
+        result, detail = transport.deliver(flood_watch, DeliveryContext(True, now))
+
+        assert result is DeliveryResult.SKIPPED
+        assert "startup-stale" in detail
+
+    def test_the_policy_does_not_apply_after_the_first_cycle(
+        self, make_transport, radio, old_warning, now, policy
+    ):
+        transport = make_transport(startup_policy=policy)
+        transport.start()
+
+        result, _ = transport.deliver(old_warning, DeliveryContext(False, now))
+
+        assert result is DeliveryResult.SENT
+
+
+class TestMeshCoreSurvivesARestartMidEvent:
+    """The failure this change exists to fix, end to end through the app loop.
+
+    Every piece was individually defensible and the combination was silent. A
+    county query returns several active alerts at once; the container restarts
+    mid-event, which the compose restart policy does by design; the first cycle
+    judges everything already in progress too old; whatever survived that was
+    refused for airtime spacing measured against a frozen clock. Both refusals
+    were written to persistent state as settled, so nothing was ever
+    reconsidered and the radio stayed quiet through the whole event.
+    """
+
+    @pytest.fixture
+    def args(self, tmp_path):
+        # delay=0 keeps the app's inter-notification pause out of the way, so
+        # what governs the radio here is its own transmission spacing.
+        return argparse.Namespace(
+            verbose=False,
+            delay=0,
+            state_file=tmp_path / "state.json",
+            state_retention_days=14,
+        )
+
+    @pytest.fixture
+    def batch(self, fresh_warning, flood_watch, now):
+        """Three products active at once, none of them newly issued."""
+        issued = (now - timedelta(minutes=40)).isoformat()
+        in_force = (now + timedelta(hours=2)).isoformat()
+
+        return [
+            dict(
+                fresh_warning,
+                id="urn:oid:flash-flood",
+                event="Flash Flood Warning",
+                sent=issued,
+                effective=issued,
+                expires=in_force,
+                ends=in_force,
+            ),
+            dict(
+                fresh_warning,
+                id="urn:oid:tornado",
+                event="Tornado Warning",
+                severity="Extreme",
+                sent=issued,
+                effective=issued,
+                expires=in_force,
+                ends=in_force,
+            ),
+            flood_watch,
+        ]
+
+    @pytest.fixture
+    def transport(self, make_transport):
+        return make_transport(
+            relevance=RelevanceFilter("statement", "unknown"),
+            rate_limiter=RateLimiter(min_interval_seconds=30, max_per_hour=12),
+            startup_policy=StartupPolicy(
+                900,
+                always_notify_warnings=False,
+                warning_min_remaining_seconds=900,
+            ),
+        )
+
+    def test_every_active_warning_reaches_the_radio(
+        self, transport, radio, batch, args, now
+    ):
+        state = AlertState()
+        transport.start()
+
+        failures = process_alerts(
+            prioritize(batch),
+            [transport],
+            state,
+            args,
+            DeliveryContext(True, now),
+        )
+
+        assert failures == 0
+        transmitted = [message for _channel, message in radio.sent]
+        # Loudest first: the Extreme tornado warning takes the airtime ahead of
+        # the flash flood warning, and both go out in the one cycle.
+        assert "Tornado Warning" in transmitted[0]
+        assert any("Flash Flood Warning" in message for message in transmitted)
+
+    def test_the_stale_watch_is_settled_and_the_warnings_are_not_lost(
+        self, transport, radio, batch, args, now
+    ):
+        state = AlertState()
+        transport.start()
+
+        process_alerts(
+            prioritize(batch), [transport], state, args,
+            DeliveryContext(True, now),
+        )
+
+        # The watch is genuinely old news and stays suppressed, terminally.
+        watch = batch[2]
+        assert state.is_settled(watch, "meshcore")
+        assert not any("Flood Watch" in message for _c, message in radio.sent)
+
+        # The warnings were delivered, so they are settled for the right
+        # reason rather than quietly written off.
+        for alert in batch[:2]:
+            assert state.is_settled(alert, "meshcore")
+
+    def test_a_capped_alert_stays_outstanding_for_the_next_cycle(
+        self, make_transport, radio, batch, args, now
+    ):
+        # With no capacity left, the alert must not be recorded as handled: on
+        # the old behavior an alert that arrived with a full budget was retired
+        # permanently and never transmitted at all.
+        transport = make_transport(
+            relevance=RelevanceFilter("statement", "unknown"),
+            rate_limiter=RateLimiter(min_interval_seconds=0, max_per_hour=1),
+            startup_policy=StartupPolicy(0, always_notify_warnings=False),
+        )
+        transport.start()
+        state = AlertState()
+
+        process_alerts(
+            prioritize(batch), [transport], state, args,
+            DeliveryContext(False, now),
+        )
+
+        assert len(radio.sent) == 1
+        settled = [
+            alert["event"] for alert in batch
+            if state.is_settled(alert, "meshcore")
+        ]
+        # Only the one that actually went out.
+        assert settled == ["Tornado Warning"]
 
 
 class TestMeshCoreFailureHandling:

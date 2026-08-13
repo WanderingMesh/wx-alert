@@ -84,12 +84,30 @@ class AlertState:
 
         return record.get("fingerprint") == alert_fingerprint(alert)
 
+    def has_record(self, alert: dict[str, Any], transport_name: str) -> bool:
+        """Has this transport ever reached a terminal outcome for this alert?
+
+        Distinct from is_settled, which compares the content fingerprint and so
+        goes false again the moment NWS reissues the product. This ignores the
+        fingerprint and stays true across a reissue, which is what the startup
+        staleness policy needs: it answers "has this transport already had its
+        turn at this alert?" rather than "is this exact version done?".
+
+        Deliberately per transport. An alert the radio has never recorded is
+        genuinely new *to the radio* even if ntfy pushed it an hour ago, which
+        is also what makes a migrated single-transport state file behave
+        correctly rather than replaying a backlog on air.
+        """
+        entry = self.alerts.get(alert_identity(alert))
+        if not entry:
+            return False
+
+        return transport_name in entry.get("transports", {})
+
     def has_seen(self, alert: dict[str, Any]) -> bool:
         """Has any transport previously handled this alert identity at all?
 
-        Distinct from is_settled: this stays true across content updates, and
-        is what the startup staleness policy uses to tell a genuinely new
-        alert from one that predates this process.
+        Distinct from is_settled: this stays true across content updates.
         """
         return alert_identity(alert) in self.alerts
 

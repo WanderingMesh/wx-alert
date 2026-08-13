@@ -70,6 +70,131 @@ TOPIC = your-long-unguessable-topic
 CHECK_INTERVAL = 300
 ```
 
+### Which area is monitored
+
+Alerts are fetched by **county**, not by coordinate. This matters more than it
+sounds, and getting it wrong is how a real Tornado Warning went undelivered.
+
+Since 2007 the NWS has issued its convective and flash-flood products as
+*storm-based warnings*: the forecaster draws a polygon around the threat, and
+the counties listed on the warning are legacy metadata for NOAA Weather Radio
+and EAS, which can only address whole counties. The polygon is the warned area.
+`api.weather.gov` honours that distinction, so a `?point=` query intersects your
+coordinate with the polygon and returns nothing when the storm is a few miles
+away — even though your county is named on the warning. Zone products such as
+watches and statements have no polygon and were always returned, which is what
+made the gap so easy to miss: the log looked healthy right up until a tornado
+warning simply never appeared.
+
+Querying the county instead returns polygon warnings and zone products alike.
+The county containing `DEFAULT_LATITUDE` / `DEFAULT_LONGITUDE` is resolved once
+at startup through the NWS `/points` endpoint and cached in `/data`, so no
+configuration is needed to get this right.
+
+**Use county codes, never forecast zone codes.** `NVC031` is Washoe County;
+`NVZ003` is the Greater Reno forecast zone. Both are valid UGC codes, both are
+accepted by the API, and the second one returns no storm-based warnings at all.
+It fails by going quiet.
+
+```ini
+[weather]
+DEFAULT_LATITUDE = 39.5296
+DEFAULT_LONGITUDE = -119.8138
+
+# Optional. The containing county is always queried; add neighbours the mesh
+# reaches into. RF coverage does not stop at a county line.
+ZONES = NVC029,NVC019
+
+# Discard warnings whose polygon is farther than this. 0 disables the test.
+ALERT_RADIUS_KM = 50
+```
+
+`ALERT_RADIUS_KM` exists because counties are not a uniform unit. Washoe County
+runs 315 km from Reno to the Oregon border; Arlington VA is 12 km across. A bare
+county query would therefore mean something completely different depending on
+where this runs, and on a shared LoRa channel the large-county case is expensive:
+warnings for places no node can hear. The radius restores local relevance
+without narrowing the fetch. Alerts with no polygon are always kept, since NWS
+has already scoped them to the county.
+
+If the `/points` lookup fails and nothing is cached, the program refuses to
+start unless `ZONES` is set explicitly. An empty zone list would return an empty
+alert list, and the container would report quiet weather indefinitely.
+
+### Finding your county codes
+
+You do not need any of this to get started. The county containing your
+coordinates is resolved automatically, and leaving `ZONES` blank is a perfectly
+good configuration. This is only for adding the *neighbouring* counties a
+wide-area mesh reaches into, since a radio network's footprint pays no
+attention to county lines.
+
+**Ask about a specific place.** The most direct method: pick a coordinate in a
+town your mesh actually covers and ask which county contains it.
+
+NWS requires a `product/version (contact)` User-Agent and its edge returns a
+bare `403` without one, so the version token is not decoration.
+
+```bash
+curl -s -H "User-Agent: wx-alert/1.0 (you@yourdomain.org)" \
+  https://api.weather.gov/points/39.5296,-119.8138 \
+  | grep -E '"(county|forecastZone)": "'
+```
+
+```json
+"forecastZone": "https://api.weather.gov/zones/forecast/NVZ003",
+"county": "https://api.weather.gov/zones/county/NVC031",
+```
+
+The last path segment is the code. Take the one on the `county` line —
+`NVC031`. The forecast zone sits directly beside it in the same response and
+looks just as official, which is exactly how the wrong one gets copied into a
+config file. Repeat for each town you want covered.
+
+**Or list every county in a state and pick by name.**
+
+```bash
+curl -s -H "User-Agent: wx-alert/1.0 (you@yourdomain.org)" \
+  "https://api.weather.gov/zones?type=county&area=NV" \
+  | python3 -c 'import json,sys; [print(f["properties"]["id"], f["properties"]["name"]) for f in json.load(sys.stdin)["features"]]' \
+  | sort
+```
+
+```
+NVC001 Churchill
+NVC003 Clark
+NVC005 Douglas
+NVC007 Elko
+...
+NVC019 Lyon
+NVC029 Storey
+NVC031 Washoe
+NVC510 Carson City
+```
+
+Seventeen entries for Nevada, which is one more than it has counties: Carson
+City is an independent city and gets its own code. Virginia has dozens of
+these, so list rather than assume.
+
+The three digits are the county's FIPS code, so `NVC031` is Nevada FIPS 031,
+Washoe. If you already know a county's FIPS number you can construct the code
+directly.
+
+**Then confirm what the program actually queried.** Whatever you configure, the
+startup log states the resolved county and the full query set. Check it once
+after any change:
+
+```
+INFO Resolved monitored point to county zone=NVC031 latitude=39.5296 longitude=-119.8138
+INFO Monitoring zones=NVC031,NVC029,NVC019 radius=50km point=39.5296,-119.8138
+```
+
+If any code in that list has a `Z` in the third position, storm-based warnings
+from that zone will never arrive and nothing further will be logged about it.
+A bad code is rejected at startup, but a *valid* forecast zone code is accepted
+and simply returns less — which is why this is worth one look at the log rather
+than trusting the config file.
+
 ### Which alerts get sent where
 
 The two transports deliberately have different postures, because the cost of
@@ -155,9 +280,13 @@ any further.
 without opening the serial port. Review the formatting before you occupy a
 shared channel with it:
 
+`--meshcore-startup-max-age 0` disables the radio's startup staleness limit for
+this run, so currently active alerts are rendered rather than suppressed as
+old news. (`--startup-max-age` governs ntfy and has no effect on the radio.)
+
 ```bash
 docker compose run --rm wx-alert \
-  --once --meshcore --meshcore-dry-run --startup-max-age 0
+  --once --meshcore --meshcore-dry-run --meshcore-startup-max-age 0
 ```
 
 ```text
@@ -226,23 +355,59 @@ Every MeshCore channel message is flood-routed and rebroadcast by every
 repeater in range, so it occupies the channel for everyone nearby. Three
 independent gates sit in front of the radio.
 
-**Relevance.** `MIN_CLASS` and `MIN_SEVERITY` must both be satisfied.
+**Relevance.** `MIN_CLASS` and `MIN_SEVERITY` must both be satisfied. This gate
+is the only one whose decision is final, because it is derived purely from the
+alert's own content: the same product will always be judged the same way, so
+there is nothing to reconsider later.
 
 **Rate limiting.** `MIN_SECONDS_BETWEEN_SENDS` and `MAX_SENDS_PER_HOUR` bound
-consumption regardless of relevance. Alerts over the cap are refused and
-logged, not queued: a weather alert delivered forty minutes late is worse
-than useless.
+consumption regardless of relevance.
+
+Minimum spacing is waited out within the cycle. A county query commonly returns
+several active alerts at once, and refusing every one after the first would put
+a single alert per poll interval on the air — at a five minute interval, half an
+hour to clear six alerts, by which point a Flash Flood Warning has expired.
+Spacing longer than two minutes is not waited for, since holding the cycle open
+that long delays the next NWS query and everything behind it.
+
+Hourly capacity is not waited for at all; the alert is simply offered again on
+the next cycle for as long as NWS still lists it as active. Neither limit
+records anything: an alert refused for want of airtime is **deferred, never
+settled**, or a full budget would permanently discard a warning that a batch of
+statements had crowded out.
+
+Alerts are dispatched loudest first, by product class and then CAP severity, so
+a budget that runs out mid-batch is spent on the most urgent products rather
+than on whichever ones NWS happened to list first.
 
 **Startup staleness.** The NWS API returns every *currently active* alert, not
 only newly issued ones, so a restart is indistinguishable from a burst of new
 alerts. On the first cycle, products older than `STARTUP_MAX_AGE_SECONDS` are
-recorded as suppressed rather than announced.
+recorded as suppressed rather than announced. Unlike a rate-limit refusal this
+one is deliberately final: the alert is old news, and re-offering it on the
+second cycle would announce it four minutes later and achieve nothing.
 
-On ntfy, active warnings bypass the staleness limit, because silently
-swallowing an ongoing warning is worse than a duplicate notification. On the
-radio they do not, because a duplicate push costs nothing while replaying
-hours-old warnings onto a shared channel after every restart costs everyone
-airtime.
+Because it is final, the decision has three parts rather than one.
+
+- An alert this transport has **already recorded an outcome for** is never
+  treated as backlog. Either NWS reissued the product, or the previous attempt
+  failed and this is the retry — and a radio that was unreachable throughout a
+  warning must not have that warning written off the moment it recovers.
+- On ntfy, active warnings bypass the limit unconditionally, because silently
+  swallowing an ongoing warning is worse than a duplicate notification.
+- On the radio they do not, because a duplicate push costs nothing while
+  replaying hours-old warnings onto a shared channel after every restart costs
+  everyone airtime. Instead the radio asks how much life a warning has left: a
+  warning still in force for at least `STARTUP_MAX_AGE_SECONDS` is broadcast
+  however old it is, and one about to expire is not. How old a warning is says
+  nothing about whether it still matters; the time it has left says exactly
+  that.
+
+The practical case this covers: a Flash Flood Warning issued 50 minutes ago and
+in force for another two hours, when the container restarts mid-event — which
+`restart: unless-stopped` and `EXIT_AFTER_FAILED_CYCLES` make a routine event,
+not an unusual one. It is old by age and it is the most important thing
+happening.
 
 > A channel message is an unacknowledged broadcast. A successful send means
 > the frame was accepted for transmission by the radio. Nothing in this
@@ -314,6 +479,10 @@ Mount it as a volume, as `docker-compose.yml` does. Without it, every restart
 re-announces every active alert — noise over HTTPS, and a burst of
 flood-routed traffic on LoRa.
 
+`/data/resolved-zones.json` caches the county resolved from the monitored
+point, so the `/points` lookup happens once rather than on every start. It is
+discarded automatically if the coordinates change, and deleting it is harmless.
+
 Recording is per transport because they fail independently: an ntfy success
 paired with a radio failure needs a representation, or the next cycle either
 duplicates the notification or permanently skips the broadcast.
@@ -321,6 +490,13 @@ duplicates the notification or permanently skips the broadcast.
 An alert is considered handled only when its **content fingerprint** matches.
 NWS reissues products under the original ID when details change, so comparing
 IDs alone would silently swallow updates.
+
+Only *terminal* outcomes are recorded: delivered, or skipped by a decision that
+cannot change. An alert declined for a reason that clears on its own — no
+airtime budget left, most often — is deferred and deliberately left absent from
+the file, so the next cycle picks it up again. Recording those would retire an
+alert over a condition that had already passed, which is how a warning could be
+fetched correctly and then never transmitted at all.
 
 State from an earlier single-transport build is migrated automatically on
 first read. Its history is attributed to ntfy, and the radio is treated as
@@ -524,7 +700,7 @@ docker compose run --rm wx-alert --ntfy --loop --verbose
 
 # Preview radio output for one cycle without transmitting
 docker compose run --rm wx-alert \
-  --meshcore --meshcore-dry-run --once --startup-max-age 0
+  --meshcore --meshcore-dry-run --once --meshcore-startup-max-age 0
 
 # Inspect delivery history
 docker compose exec wx-alert python -m json.tool /data/notified-alerts.json
