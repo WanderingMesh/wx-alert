@@ -9,10 +9,12 @@ from typing import Any, Sequence
 import requests
 
 from .formatting import build_compact_stdout_message, build_verbose_message
+from .geo import geometry_distance_km
 from .health import heartbeat_path, write_heartbeat
 from .nws import (
     alert_age_seconds,
     alert_class,
+    alert_geometry,
     alert_sent_time,
     format_age,
     get_active_alerts,
@@ -44,22 +46,17 @@ def settlement_names(transports: Sequence[Transport]) -> list[str]:
 
 def fetch_alerts(
     session: requests.Session,
-    latitude: float,
-    longitude: float,
+    zones: Sequence[str],
 ) -> list[dict[str, Any]] | None:
     """Query NWS, logging and absorbing every expected failure mode.
 
     Returns None when the query failed. An empty list is a valid result
     meaning "no active alerts", which is why None is used for failure.
     """
-    LOGGER.info(
-        "Querying NWS active alerts latitude=%.5f longitude=%.5f",
-        latitude,
-        longitude,
-    )
+    LOGGER.info("Querying NWS active alerts zones=%s", ",".join(zones))
 
     try:
-        return get_active_alerts(session, latitude, longitude)
+        return get_active_alerts(session, zones)
     except requests.Timeout:
         LOGGER.error("NWS API request timed out")
     except requests.HTTPError as exc:
@@ -79,6 +76,46 @@ def fetch_alerts(
         LOGGER.error("NWS returned invalid JSON error=%s", exc)
 
     return None
+
+
+def filter_by_proximity(
+    alerts: list[dict[str, Any]],
+    latitude: float,
+    longitude: float,
+    radius_km: float,
+) -> list[dict[str, Any]]:
+    """Drop polygon warnings whose warned area is too far to be relevant.
+
+    Alerts are fetched by county because that is the only query form that
+    returns storm-based warnings at all, but a county can be 300 km long. This
+    restores local relevance without narrowing the fetch.
+
+    An alert with no polygon is kept unconditionally. Watches, advisories, and
+    statements are issued to a whole zone, so NWS has already decided they
+    apply to the queried county; there is no geometry to be far away.
+    """
+    if radius_km <= 0:
+        return alerts
+
+    kept: list[dict[str, Any]] = []
+
+    for alert in alerts:
+        distance = geometry_distance_km(alert_geometry(alert), latitude, longitude)
+
+        if distance is None or distance <= radius_km:
+            kept.append(alert)
+            continue
+
+        LOGGER.info(
+            "Alert is outside the monitored radius event=%r distance=%.1fkm "
+            "radius=%.1fkm area=%r",
+            clean_field(alert.get("event"), "Unknown weather alert"),
+            distance,
+            radius_km,
+            clean_field(alert.get("areaDesc"), "unknown area"),
+        )
+
+    return kept
 
 
 def deliver_alert(
@@ -234,9 +271,18 @@ def perform_alert_check(
     failed_transports: set[str] | None = None,
 ) -> int:
     """Perform one NWS query and deliver whatever is outstanding."""
-    alerts = fetch_alerts(session, args.latitude, args.longitude)
+    alerts = fetch_alerts(session, args.query_zones)
     if alerts is None:
         return STATUS_SOURCE_FAILURE
+
+    # Filtered before deduplication, so a distant warning is never recorded as
+    # handled. If the storm moves closer on a later cycle it is still new work.
+    alerts = filter_by_proximity(
+        alerts,
+        args.latitude,
+        args.longitude,
+        args.alert_radius_km,
+    )
 
     removed = prune_state(state, args.state_retention_days)
     if removed:

@@ -97,6 +97,50 @@ class TestCoreConfiguration:
             load_configuration(parser)
 
 
+class TestZonesAndRadius:
+    def test_zones_are_optional(self):
+        # The county containing the point is resolved at startup, so an
+        # existing config file needs no edit to gain polygon warnings.
+        assert load_configuration(parse(MINIMAL)).zones == ()
+
+    def test_applies_the_default_radius(self):
+        assert load_configuration(parse(MINIMAL)).alert_radius_km == 50.0
+
+    def test_reads_a_zone_list(self):
+        config = load_configuration(
+            parse(MINIMAL.replace("[ntfy]", "ZONES = NVC031, nvc029\n\n[ntfy]"))
+        )
+        assert config.zones == ("NVC031", "NVC029")
+
+    def test_rejects_a_malformed_zone(self):
+        # Failing at startup beats querying a zone that returns nothing.
+        with pytest.raises(ConfigurationError, match="UGC"):
+            load_configuration(
+                parse(MINIMAL.replace("[ntfy]", "ZONES = Washoe\n\n[ntfy]"))
+            )
+
+    def test_reads_a_radius(self):
+        config = load_configuration(
+            parse(MINIMAL.replace("[ntfy]", "ALERT_RADIUS_KM = 25.5\n\n[ntfy]"))
+        )
+        assert config.alert_radius_km == 25.5
+
+    def test_zero_is_accepted_and_disables_the_test(self):
+        config = load_configuration(
+            parse(MINIMAL.replace("[ntfy]", "ALERT_RADIUS_KM = 0\n\n[ntfy]"))
+        )
+        assert config.alert_radius_km == 0
+
+    @pytest.mark.parametrize("value", ["-1", "5000", "wide"])
+    def test_rejects_an_impossible_radius(self, value):
+        with pytest.raises(ConfigurationError):
+            load_configuration(
+                parse(
+                    MINIMAL.replace("[ntfy]", f"ALERT_RADIUS_KM = {value}\n\n[ntfy]")
+                )
+            )
+
+
 class TestServerUrl:
     @pytest.mark.parametrize(
         ("raw", "expected"),

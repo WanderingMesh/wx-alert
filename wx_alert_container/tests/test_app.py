@@ -6,10 +6,12 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from conftest import RENO_LATITUDE, RENO_LONGITUDE
 
 from wx_alert.app import (
     CONSOLE_TRANSPORT_NAME,
     deliver_alert,
+    filter_by_proximity,
     process_alerts,
     settlement_names,
 )
@@ -56,6 +58,61 @@ def args(tmp_path):
 @pytest.fixture
 def context(now):
     return DeliveryContext(first_cycle=False, now=now)
+
+
+def keep(alerts):
+    return [alert["event"] for alert in alerts]
+
+
+class TestProximityFilter:
+    """Fetching by county is broad; this is what restores local relevance."""
+
+    def test_keeps_a_nearby_warning(self, tornado_warning):
+        # The alert this whole change exists to deliver: about 15 km east of
+        # the monitored point, outside the polygon, well inside mesh range.
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 50
+        )
+        assert keep(kept) == ["Tornado Warning"]
+
+    def test_drops_the_same_warning_under_a_tight_radius(self, tornado_warning):
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 5
+        )
+        assert kept == []
+
+    def test_keeps_a_zone_product_that_has_no_polygon(self, flood_watch):
+        # NWS already scoped it to the queried county. There is no geometry
+        # to be far away, and dropping it would silence every watch.
+        assert "geometry" not in flood_watch
+
+        kept = filter_by_proximity(
+            [flood_watch], RENO_LATITUDE, RENO_LONGITUDE, 1
+        )
+        assert keep(kept) == ["Flood Watch"]
+
+    def test_a_zero_radius_disables_the_test(self, tornado_warning):
+        kept = filter_by_proximity(
+            [tornado_warning], RENO_LATITUDE, RENO_LONGITUDE, 0
+        )
+        assert keep(kept) == ["Tornado Warning"]
+
+    def test_a_far_county_is_excluded(self, tornado_warning):
+        # Washoe County runs 315 km north to the Oregon border. Without this,
+        # a county query would put warnings from Gerlach on the radio.
+        gerlach_latitude, gerlach_longitude = 40.6555, -119.3560
+
+        kept = filter_by_proximity(
+            [tornado_warning], gerlach_latitude, gerlach_longitude, 50
+        )
+        assert kept == []
+
+    def test_preserves_order_and_identity(self, tornado_warning, flood_watch):
+        alerts = [flood_watch, tornado_warning]
+        kept = filter_by_proximity(alerts, RENO_LATITUDE, RENO_LONGITUDE, 50)
+
+        assert keep(kept) == ["Flood Watch", "Tornado Warning"]
+        assert kept[1] is tornado_warning
 
 
 class TestSettlementNames:

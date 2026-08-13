@@ -19,6 +19,7 @@ from .state import StateError, load_state
 from .transports.base import Transport, TransportError
 from .transports.meshcore import MeshCoreTransport
 from .transports.ntfy import NtfyTransport
+from .zones import ZoneResolutionError, determine_zones, zone_cache_path
 
 LOGGER = logging.getLogger("wx-alert")
 
@@ -155,6 +156,29 @@ def main(argv: list[str] | None = None) -> int:
             # would re-deliver every currently active alert.
             LOGGER.error("Persistent state initialization failed error=%s", exc)
             return STATUS_STATE_FAILURE
+
+        try:
+            args.query_zones = determine_zones(
+                session,
+                latitude=args.latitude,
+                longitude=args.longitude,
+                extra_zones=args.zones,
+                cache_path=zone_cache_path(args.state_file),
+            )
+        except ZoneResolutionError as exc:
+            # Refuse to start rather than query nothing. An empty zone list
+            # returns an empty alert list, so the program would report "no
+            # active alerts" forever while the weather did as it pleased.
+            LOGGER.error("Could not determine which NWS zones to query: %s", exc)
+            return STATUS_STATE_FAILURE
+
+        LOGGER.info(
+            "Monitoring zones=%s radius=%gkm point=%.4f,%.4f",
+            ",".join(args.query_zones),
+            args.alert_radius_km,
+            args.latitude,
+            args.longitude,
+        )
 
         started: list[Transport] = []
         try:

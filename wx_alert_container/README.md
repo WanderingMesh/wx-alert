@@ -70,6 +70,57 @@ TOPIC = your-long-unguessable-topic
 CHECK_INTERVAL = 300
 ```
 
+### Which area is monitored
+
+Alerts are fetched by **county**, not by coordinate. This matters more than it
+sounds, and getting it wrong is how a real Tornado Warning went undelivered.
+
+Since 2007 the NWS has issued its convective and flash-flood products as
+*storm-based warnings*: the forecaster draws a polygon around the threat, and
+the counties listed on the warning are legacy metadata for NOAA Weather Radio
+and EAS, which can only address whole counties. The polygon is the warned area.
+`api.weather.gov` honours that distinction, so a `?point=` query intersects your
+coordinate with the polygon and returns nothing when the storm is a few miles
+away — even though your county is named on the warning. Zone products such as
+watches and statements have no polygon and were always returned, which is what
+made the gap so easy to miss: the log looked healthy right up until a tornado
+warning simply never appeared.
+
+Querying the county instead returns polygon warnings and zone products alike.
+The county containing `DEFAULT_LATITUDE` / `DEFAULT_LONGITUDE` is resolved once
+at startup through the NWS `/points` endpoint and cached in `/data`, so no
+configuration is needed to get this right.
+
+**Use county codes, never forecast zone codes.** `NVC031` is Washoe County;
+`NVZ003` is the Greater Reno forecast zone. Both are valid UGC codes, both are
+accepted by the API, and the second one returns no storm-based warnings at all.
+It fails by going quiet.
+
+```ini
+[weather]
+DEFAULT_LATITUDE = 39.5296
+DEFAULT_LONGITUDE = -119.8138
+
+# Optional. The containing county is always queried; add neighbours the mesh
+# reaches into. RF coverage does not stop at a county line.
+ZONES = NVC029,NVC019
+
+# Discard warnings whose polygon is farther than this. 0 disables the test.
+ALERT_RADIUS_KM = 50
+```
+
+`ALERT_RADIUS_KM` exists because counties are not a uniform unit. Washoe County
+runs 315 km from Reno to the Oregon border; Arlington VA is 12 km across. A bare
+county query would therefore mean something completely different depending on
+where this runs, and on a shared LoRa channel the large-county case is expensive:
+warnings for places no node can hear. The radius restores local relevance
+without narrowing the fetch. Alerts with no polygon are always kept, since NWS
+has already scoped them to the county.
+
+If the `/points` lookup fails and nothing is cached, the program refuses to
+start unless `ZONES` is set explicitly. An empty zone list would return an empty
+alert list, and the container would report quiet weather indefinitely.
+
 ### Which alerts get sent where
 
 The two transports deliberately have different postures, because the cost of
@@ -313,6 +364,10 @@ the entire burst on the next cycle — producing more duplicates, not fewer.
 Mount it as a volume, as `docker-compose.yml` does. Without it, every restart
 re-announces every active alert — noise over HTTPS, and a burst of
 flood-routed traffic on LoRa.
+
+`/data/resolved-zones.json` caches the county resolved from the monitored
+point, so the `/points` lookup happens once rather than on every start. It is
+discarded automatically if the coordinates change, and deleting it is harmless.
 
 Recording is per transport because they fail independently: an ntfy success
 paired with a radio failure needs a representation, or the next cycle either
