@@ -433,13 +433,12 @@ way to tell whether two separate things happened; the marker answers that
 without them having to think about it.
 
 The second is defensive, against deduplication. MeshCore deduplicates at two
-levels, and neither is a reason to expect identical copies to survive:
+levels, and only one of them is a risk to a repeat:
 
 - **Mesh layer.** `MeshTables::hasSeen()` keeps a cyclic table of SHA-256
   hashes over the payload, and repeaters use it to stop flood packets looping.
-  This one should *not* affect repeats: a channel message encrypts the sender
-  timestamp inside the payload, and copies at least a second apart therefore
-  hash differently.
+  It cannot affect repeats: the hash covers the whole payload, and two copies
+  differ in their timestamp, their marker and their cipher MAC.
 - **Client layer.** The companion protocol documentation tells client authors
   to deduplicate incoming messages, suggesting timestamp and content as the
   key. What a given client actually keys on is up to that client, and a client
@@ -600,49 +599,68 @@ doing.
 
 ### Repeats and deduplication
 
-Whether identical copies of a channel message actually get deduplicated is
-**unresolved**, and the `1/2` marker described under *Repeated transmission*
-is a precaution rather than a proven fix.
+Whether channel copies get deduplicated was open for two versions. It is now
+answered: the losses are ordinary radio losses, and deduplication is not
+involved. What remains open is the loss *rate*, which is why this stays here.
 
-Two trials so far, both on `#rno-wx-alerts`:
+Four trials, all on `#rno-wx-alerts`:
 
 | Trial | Sent | Arrived |
 |---|---|---|
 | Paired A/B test | 2 byte-identical, 2 marked | 1 of the identical, 2 of the marked |
 | `--meshcore-test` self-test | 2 marked | 2 |
+| Live Flash Flood Warning, 135/141 bytes | 2 marked | 1 (`1/2` arrived, `2/2` never did) |
+| `--meshcore-test` self-test | 2 marked | 2 |
 
-So marked copies are 4 for 4, and the only copy ever lost was one of an
-identical pair. That is consistent with deduplication, but it does not
-demonstrate it. An ordinary collision is exactly the loss the repeat exists to
-cover, one message out of four had already gone missing during bring-up, and a
-single missing message is a sample of one however many marked copies arrive
-alongside it.
+Marked copies are 7 of 8, and the third trial is the one that decides it: a
+*marked* copy went missing. Marked copies differ in their content, so no
+deduplication that looks at the message can explain the loss, which leaves the
+plain radio loss the repeat exists to cover. That makes the identical copy lost
+in the first trial unremarkable rather than suspicious — this link drops
+roughly one copy in eight whether or not the copies are distinguishable.
 
-The mechanisms argue *against* deduplication being the cause, and the obvious
-candidate explanation does not survive a look at the source.
+The source agrees, and more firmly than the argument here used to.
+`Packet::calculatePacketHash()` hashes the payload type and then the entire
+payload, `sha.update(payload, payload_len)`, and `SimpleMeshTables::hasSeen()`
+compares full hashes by `memcmp` against a 160-entry cyclic table. A group text
+payload is a channel-hash byte, a two-byte cipher MAC, then ciphertext over a
+four-byte timestamp, a flags byte and the text. Three fields therefore differ
+between two marked copies: the timestamp, the marker, and the MAC that covers
+them. The failure mode worth ruling out was a hash over only a *prefix* of the
+payload, because the marker sits at the end of the text where a prefix hash
+would not see it. The hash covers the whole payload.
 
-That candidate is a coarse clock: if the timestamp inside the hash were
-rounded to, say, the minute, copies seconds apart would hash identically and
-the mesh would drop the repeat as a designed behaviour. It is not rounded.
-`BaseChatMesh::sendGroupMessage()` copies the full 32-bit seconds value into
-the payload with `memcpy(temp, &timestamp, 4)`, commented *"mostly an extra
-blob to help make packet_hash unique"* — making the hash differ is the whole
-point of it being there. The value comes from the host, which stamps
-`int(time.time())` per send, and the companion protocol carries it as
-seconds. Nothing in that path quantises.
+The coarse-clock explanation is dead for the same reason it always was. If the
+timestamp inside the hash were rounded to, say, the minute, copies seconds
+apart would hash identically and the mesh would drop the repeat as a designed
+behaviour. It is not rounded. `BaseChatMesh::sendGroupMessage()` copies the
+full 32-bit seconds value into the payload with `memcpy(temp, &timestamp, 4)`,
+commented *"mostly an extra blob to help make packet_hash unique"* — making the
+hash differ is the whole point of the field. The value comes from the host,
+which stamps `int(time.time())` per send, and the companion protocol carries it
+as seconds. Nothing in that path quantises.
 
-So copies a second or more apart hash differently and repeaters should forward
-both. The companion protocol suggests clients key on timestamp and content
-together, which would also pass both. Deduplication would only explain the
-result if some client in the path keys on content alone.
+The open question is now the loss rate, and there is a candidate better than
+chance. The lost copy carried a live warning at 135 of the 141 available bytes;
+both clean self-tests carried short text. Longer packets occupy the channel
+longer and have more to corrupt, so copy loss should scale with message length.
+If that holds, real alerts — which run to the byte budget — lose copies more
+often than a self-test will ever reveal, and two clean self-tests are weak
+evidence that the repeat works when it matters. Testing that means sending
+padded messages at several lengths and counting arrivals per length.
 
-To settle it, run the paired test enough times to count identical-pair
-arrivals. Identical copies arriving *never* is deduplication; arriving
-sometimes is loss. One trial cannot tell those apart, and the marked copies
-say nothing either way — they are the control.
+Two limits on the data above. The receiving device was not recorded per trial,
+so the trials cannot be compared against each other for path quality. And the
+fourth repeats the second's conditions rather than adding a new one.
 
-The marker is worth keeping either way: it costs four bytes, and it tells a
-reader that they are looking at one warning rather than two.
+Should a future loss still look like deduplication, the firmware counts it
+instead of leaving it to inference: `SimpleMeshTables` tracks `_flood_dups` and
+`_direct_dups`, exposed through the companion protocol as the flood and direct
+route duplicate counts, alongside a stats reset. A copy dropped as a duplicate
+increments them. A copy lost on the air does not.
+
+The marker stays regardless: it costs four bytes, and it tells a reader that
+they are looking at one warning rather than two.
 
 ---
 
