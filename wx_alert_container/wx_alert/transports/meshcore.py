@@ -33,6 +33,7 @@ from ..mesh_format import build_mesh_message, mesh_text_budget
 from ..policy import StartupPolicy, should_suppress_on_startup
 from ..radio import RadioResetError, hard_reset
 from ..ratelimit import RateLimiter, RelevanceFilter
+from ..scope import FORCE_UNSCOPED, ProbeRun, scope_key
 from ..shutdown import STOP_EVENT
 from ..text import clean_field
 from .base import DeliveryContext, DeliveryResult, TransportError
@@ -128,6 +129,7 @@ class MeshCoreTransport:
         port: str,
         baud: int,
         channel_index: int,
+        scope: str | None = None,
         relevance: RelevanceFilter,
         rate_limiter: RateLimiter,
         startup_policy: StartupPolicy,
@@ -146,6 +148,7 @@ class MeshCoreTransport:
         self._port = port
         self._baud = baud
         self._channel_index = channel_index
+        self._scope = scope
         self._relevance = relevance
         self._rate_limiter = rate_limiter
         self._startup_policy = startup_policy
@@ -181,19 +184,32 @@ class MeshCoreTransport:
             self._bridge = _AsyncBridge()
 
         # create_serial returns None rather than raising when the device does
-        # not answer, so the None check is load-bearing.
-        return self._bridge.call(
-            MeshCore.create_serial(
-                self._port,
-                self._baud,
-                debug=self._debug,
-                # The library re-sends appstart after reconnecting, which the
-                # firmware requires to re-initialize the session.
-                auto_reconnect=True,
-                max_reconnect_attempts=3,
-            ),
-            timeout=self._connect_timeout,
-        )
+        # not answer, so the None check is load-bearing. A device node that is
+        # absent or unreadable is a different failure and does raise, and it
+        # is translated here: it is not something a hard reset can fix, and
+        # letting a SerialException reach the operator as a traceback buries
+        # the one line that says which port and why.
+        try:
+            return self._bridge.call(
+                MeshCore.create_serial(
+                    self._port,
+                    self._baud,
+                    debug=self._debug,
+                    # The library re-sends appstart after reconnecting, which
+                    # the firmware requires to re-initialize the session.
+                    auto_reconnect=True,
+                    max_reconnect_attempts=3,
+                ),
+                timeout=self._connect_timeout,
+            )
+        except TimeoutError:
+            # The port opened and the radio went quiet, which the caller
+            # already knows how to recover from.
+            raise
+        except OSError as exc:
+            raise TransportError(
+                f"cannot open serial port {self._port}: {exc}"
+            ) from exc
 
     def _connect(self) -> None:
         """Open the serial port and learn what we need from the radio."""
@@ -263,15 +279,83 @@ class MeshCoreTransport:
 
         channel_name = (channel.payload or {}).get("channel_name", "")
 
+        # Before the connected message, so a rejected scope fails startup with
+        # the reason rather than a reassuring "connected" line above it.
+        self._apply_scope()
+
         LOGGER.info(
             "MeshCore connected port=%s node=%r channel=%d name=%r "
-            "text_budget=%d bytes",
+            "text_budget=%d bytes scope=%s",
             self._port,
             self._node_name,
             self._channel_index,
             channel_name,
             self._budget,
+            self._describe_scope(),
         )
+
+    def _apply_scope(self) -> None:
+        """Put the radio into the configured region scope.
+
+        Does nothing at all when no scope is configured, which leaves whatever
+        the radio was already doing — including a default scope the operator
+        set on the device — exactly as it was.
+
+        The scope is device state set by its own command rather than an
+        argument to the send, so it has to be asserted rather than assumed. It
+        is applied both after connecting and before every burst, because a
+        hard reset reboots the radio and the send scope does not survive that.
+        A radio that recovered from a wedge mid-run would otherwise resume
+        transmitting into the wrong region, or into none, with nothing in the
+        log to say the containment had quietly stopped applying.
+
+        A failure here raises. Carrying on would transmit outside the region
+        the operator asked for, and doing that silently is the outcome this
+        whole feature exists to prevent.
+        """
+        if self._scope is None:
+            return
+
+        self._send_scope_command(self._scope)
+
+    def _send_scope_command(self, scope: str | None) -> None:
+        """Set the radio's send scope.
+
+        None means revert to the radio's own default, which is how a probe
+        puts the radio back afterwards. That is distinct from an unconfigured
+        SCOPE, which never reaches this method at all.
+        """
+        from meshcore import EventType
+
+        if self._meshcore is None or self._bridge is None:
+            raise TransportError("MeshCore transport is not connected")
+
+        result = self._bridge.call(
+            self._meshcore.commands.set_flood_scope(scope),
+            timeout=self._send_timeout,
+        )
+
+        if result is None:
+            raise TransportError(
+                f"radio did not respond when setting scope {scope!r}"
+            )
+
+        if result.type == EventType.ERROR:
+            # Channel scoping needs firmware 1.12.0 or newer, and an older
+            # radio rejects the command outright.
+            raise TransportError(
+                f"radio rejected scope {scope!r}: {result.payload}. "
+                "Region scoping needs MeshCore firmware 1.12.0 or newer; "
+                "leave [meshcore] SCOPE blank to transmit without one."
+            )
+
+    def _describe_scope(self) -> str:
+        """How the scope should read in a log line."""
+        if self._scope is None:
+            return "unset"
+        if self._scope == FORCE_UNSCOPED:
+            return "forced-unscoped"
+        return f"{self._scope} key={scope_key(self._scope)}"
 
     def _ensure_connected(self) -> None:
         if self._meshcore is None:
@@ -322,10 +406,147 @@ class MeshCoreTransport:
         # the test proves what will actually happen rather than a simpler case.
         copies = self._transmit_burst(text)
         LOGGER.info(
-            "MeshCore test transmitted channel=%d bytes=%d copies=%d",
+            "MeshCore test transmitted channel=%d bytes=%d copies=%d scope=%s",
             self._channel_index,
             len(text.encode("utf-8")) + self._copy_label_reserve(),
             copies,
+            self._describe_scope(),
+        )
+
+    # -- diagnostics -------------------------------------------------------
+
+    def list_channels(self, limit: int = 16) -> list[tuple[int, str]]:
+        """Read back the channels the radio has configured.
+
+        Finding the index of a channel by name is otherwise guesswork, and
+        guessing wrong makes a probe fail for a reason that looks exactly like
+        the region being wrong.
+        """
+        from meshcore import EventType
+
+        self._ensure_connected()
+        found: list[tuple[int, str]] = []
+
+        for index in range(limit):
+            result = self._bridge.call(
+                self._meshcore.commands.get_channel(index),
+                timeout=self._send_timeout,
+            )
+
+            if result is None or result.type == EventType.ERROR:
+                continue
+
+            name = (result.payload or {}).get("channel_name", "")
+            if name:
+                found.append((index, name))
+
+        return found
+
+    def probe_scope(
+        self,
+        region: str,
+        *,
+        channel_index: int,
+        text: str = "test",
+        timeout: float = 60.0,
+    ) -> tuple[ProbeRun, ProbeRun]:
+        """Send a probe unscoped, then scoped, and report what came back.
+
+        Both legs are needed. A scoped probe that goes unanswered has several
+        possible causes that look identical from here, and establishing that
+        the bot replies at all when unscoped eliminates most of them.
+
+        The radio is put back to its own default scope afterwards, so a probe
+        cannot leave the device stuck in a region nobody intended.
+        """
+        self._ensure_connected()
+
+        # Incoming messages arrive as a notification the client has to act on,
+        # so without this the reply is announced and never collected.
+        self._bridge.call(
+            self._meshcore.start_auto_message_fetching(),
+            timeout=self._send_timeout,
+        )
+
+        try:
+            control = self._probe_once(
+                label="unscoped control",
+                scope=FORCE_UNSCOPED,
+                channel_index=channel_index,
+                text=f"{text}",
+                timeout=timeout,
+            )
+            scoped = self._probe_once(
+                label=region,
+                scope=region,
+                channel_index=channel_index,
+                text=f"{text}",
+                timeout=timeout,
+            )
+        finally:
+            try:
+                # Back to the device default rather than to whatever the last
+                # leg set, so a probe leaves no trace on the radio.
+                self._send_scope_command(None)
+                self._bridge.call(
+                    self._meshcore.stop_auto_message_fetching(),
+                    timeout=self._send_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 - cleanup on a radio that
+                # may already be unhappy; the probe result still stands.
+                LOGGER.debug("Error cleaning up after the scope probe: %s", exc)
+
+        return control, scoped
+
+    def _probe_once(
+        self,
+        *,
+        label: str,
+        scope: str,
+        channel_index: int,
+        text: str,
+        timeout: float,
+    ) -> ProbeRun:
+        """One leg of a probe: set a scope, send, wait for the bot."""
+        from meshcore import EventType
+
+        self._send_scope_command(scope)
+
+        LOGGER.info(
+            "Probing channel=%d scope=%s text=%r",
+            channel_index,
+            label,
+            text,
+        )
+
+        self._transmit_to(channel_index, text)
+
+        reply = self._bridge.call(
+            self._meshcore.wait_for_event(
+                EventType.CHANNEL_MSG_RECV,
+                {"channel_idx": channel_index},
+                timeout=timeout,
+            ),
+            # The bridge must outlast the wait it is carrying, or it would
+            # time out first and report the wrong failure.
+            timeout=timeout + 10,
+        )
+
+        if reply is None:
+            LOGGER.warning("No reply within %.0fs scope=%s", timeout, label)
+            return ProbeRun(label=label, scope=scope, replied=False)
+
+        payload = reply.payload or {}
+        body = str(payload.get("text", "")).strip()
+
+        LOGGER.info("Reply scope=%s text=%r", label, body)
+
+        return ProbeRun(
+            label=label,
+            scope=scope,
+            replied=True,
+            text=body,
+            path_len=payload.get("path_len"),
         )
 
     def deliver(
@@ -369,10 +590,11 @@ class MeshCoreTransport:
 
         if self._dry_run:
             LOGGER.info(
-                "MeshCore dry-run channel=%d bytes=%d/%d text=%r",
+                "MeshCore dry-run channel=%d bytes=%d/%d scope=%s text=%r",
                 self._channel_index,
                 size,
                 self._budget,
+                self._describe_scope(),
                 text,
             )
             self._rate_limiter.record(self._clock())
@@ -393,12 +615,13 @@ class MeshCoreTransport:
 
         LOGGER.info(
             "MeshCore transmitted event=%r channel=%d bytes=%d/%d copies=%d "
-            "text=%r",
+            "scope=%s text=%r",
             event,
             self._channel_index,
             size,
             self._budget,
             copies,
+            self._describe_scope(),
             text,
         )
 
@@ -519,6 +742,10 @@ class MeshCoreTransport:
         deduplicating on message content cannot collapse the copies back into
         one and quietly undo the whole exercise.
         """
+        # Once for the whole burst rather than per copy: the scope is device
+        # state that persists across the gap between copies.
+        self._apply_scope()
+
         self._transmit(text + self._copy_label(1))
         copies = 1
 
@@ -553,13 +780,21 @@ class MeshCoreTransport:
         return copies
 
     def _transmit(self, text: str) -> None:
+        self._transmit_to(self._channel_index, text)
+
+    def _transmit_to(self, channel_index: int, text: str) -> None:
+        """Send one message to an explicit channel.
+
+        Split out from _transmit so a diagnostic can address the test channel
+        without disturbing the configured alert channel.
+        """
         from meshcore import EventType
 
         if self._meshcore is None or self._bridge is None:
             raise TransportError("MeshCore transport is not connected")
 
         result = self._bridge.call(
-            self._meshcore.commands.send_chan_msg(self._channel_index, text),
+            self._meshcore.commands.send_chan_msg(channel_index, text),
             timeout=self._send_timeout,
         )
 
