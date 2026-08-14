@@ -39,7 +39,7 @@ the ntfy.sh TOPIC values.  But it's hard to call this a security consideration.
   Regions are configured on repeaters, messages are scoped to regions.  You may set SCOPE in config.local.ini, e.g. 'nnv' to limit the
   propagation of a locality-specific alert (Elko doesn't care if we are flooding, Reno doesn't care if Elko is under 18' of snow, etc.)
 
-# Alert Radius
+### Alert Radius
   ALERT_RADIUS_KM prevents alerting on a polygon-based warning if it is > ALERT_RADIUS_KM from the point defined by:
     DEFAULT_LATITUDE && DEFAULT_LONGITUDE
 
