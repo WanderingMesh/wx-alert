@@ -638,6 +638,44 @@ so stop the running container first.
 
 ---
 
+## Upgrading
+
+`config.ini` in this repository is a template. Your deployment's real config —
+`config.local.ini`, bind-mounted over it — is deliberately untracked, so
+nothing in a `git pull` or a rebuild ever touches it.
+
+That is the right behaviour, and it has one sharp edge: **a setting added in a
+new version does not appear in a config file that already exists.** The new
+option is documented in the template you are not reading, absent from the file
+you are, and the loader quietly falls back to a default. Nothing warns you.
+
+After upgrading, list what your config is missing:
+
+```bash
+comm -23 <(grep -oE '^[A-Z_]+' config.ini | sort -u) \
+         <(grep -oE '^[A-Z_]+' config.local.ini | sort -u)
+```
+
+Anything printed is running on its built-in default. Copy the block for it out
+of `config.ini`, including the comments, so the next person to read your config
+can see the setting exists. The check compares key names rather than sections,
+so a name reused across two sections is only reported when it is missing from
+both.
+
+### Settings added by version
+
+| Version | Setting | Default when absent |
+|---|---|---|
+| 1.3.0 | `[meshcore] SCOPE` | blank — the radio's scope state is untouched, exactly as before |
+| 1.2.0 | `[weather] ZONES` | blank — the county is resolved from the coordinates and cached |
+| 1.2.0 | `[weather] ALERT_RADIUS_KM` | 50 |
+
+Every default above preserves the previous version's behaviour, so an upgrade
+changes nothing until a value is set. That is a deliberate constraint on new
+settings, not a coincidence.
+
+---
+
 ## Persistent state
 
 `/data/notified-alerts.json` records what has been delivered, per transport.
