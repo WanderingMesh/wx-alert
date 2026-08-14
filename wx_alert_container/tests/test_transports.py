@@ -145,7 +145,10 @@ class FakeRadio:
         self._replies.append(
             {
                 "channel_idx": channel,
-                "text": f"path: whatever scope: {scope or 'none'}",
+                "text": (
+                    f"{self.self_info['name']}, heard you. "
+                    f"path: whatever scope: {scope or 'none'}"
+                ),
                 "path_len": self.bot_path_len if relayed else 0,
             }
         )
@@ -157,6 +160,12 @@ class FakeRadio:
     async def stop_auto_message_fetching(self):
         self.fetching = False
         self.fetch_calls.append("stop")
+
+    def queue_chatter(self, channel, text, path_len=1):
+        """Someone else talking on the same channel."""
+        self._replies.append(
+            {"channel_idx": channel, "text": text, "path_len": path_len}
+        )
 
     async def wait_for_event(self, event_type, filters=None, timeout=None):
         from meshcore import EventType
@@ -1322,6 +1331,37 @@ class TestScopeProbe:
 
         ok, _ = interpret_probe(scoped, control)
         assert ok
+
+    def test_other_peoples_chatter_is_not_mistaken_for_a_reply(
+        self, make_transport, bot
+    ):
+        # A test channel carries conversations. Taking the first message to
+        # arrive as the answer reported a region as working on the strength
+        # of someone discussing repeater IDs.
+        bot.carried_regions = set()
+        bot.bot_channel = None
+        transport = make_transport()
+        transport.start()
+        bot.queue_chatter(3, "KW-T096: it identifies repeaters by key prefix")
+
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
+
+        assert not scoped.replied
+
+    def test_a_reply_is_found_despite_traffic_ahead_of_it(
+        self, make_transport, bot
+    ):
+        # Ignoring chatter must mean reading past it, not giving up at it.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+        transport.start()
+        bot.queue_chatter(3, "KW-T096: unrelated")
+        bot.queue_chatter(3, "someone else: also unrelated")
+
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        assert "WX-Reno" in scoped.text
 
     def test_a_region_nothing_carries_is_caught(self, make_transport, bot):
         # The control proves the bot is answering, so the scoped silence

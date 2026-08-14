@@ -27,6 +27,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from ..mesh_format import build_mesh_message, mesh_text_budget
@@ -637,33 +638,56 @@ class MeshCoreTransport:
 
         self._transmit_to(channel_index, text)
 
-        reply = self._bridge.call(
-            self._meshcore.wait_for_event(
-                EventType.CHANNEL_MSG_RECV,
-                {"channel_idx": channel_index},
-                timeout=timeout,
-            ),
-            # The bridge must outlast the wait it is carrying, or it would
-            # time out first and report the wrong failure.
-            timeout=timeout + 10,
-        )
+        deadline = monotonic() + timeout
 
-        if reply is None:
-            LOGGER.warning("No reply within %.0fs scope=%s", timeout, label)
-            return ProbeRun(label=label, scope=scope, replied=False)
+        # A test channel carries other people's conversations. Taking the
+        # first message to arrive as the answer turns ordinary chatter into a
+        # pass, so keep reading until something addressed to this node shows
+        # up. A bot that never names us times out instead, which is the safe
+        # direction to be wrong in.
+        while True:
+            remaining = deadline - monotonic()
 
-        payload = reply.payload or {}
-        body = str(payload.get("text", "")).strip()
+            if remaining <= 0:
+                break
 
-        LOGGER.info("Reply scope=%s text=%r", label, body)
+            reply = self._bridge.call(
+                self._meshcore.wait_for_event(
+                    EventType.CHANNEL_MSG_RECV,
+                    {"channel_idx": channel_index},
+                    timeout=remaining,
+                ),
+                # The bridge must outlast the wait it is carrying, or it would
+                # time out first and report the wrong failure.
+                timeout=remaining + 10,
+            )
 
-        return ProbeRun(
-            label=label,
-            scope=scope,
-            replied=True,
-            text=body,
-            path_len=payload.get("path_len"),
-        )
+            if reply is None:
+                break
+
+            payload = reply.payload or {}
+            body = str(payload.get("text", "")).strip()
+
+            if self._node_name not in body:
+                LOGGER.info(
+                    "Ignoring channel traffic not addressed to %s: %r",
+                    self._node_name,
+                    body,
+                )
+                continue
+
+            LOGGER.info("Reply scope=%s text=%r", label, body)
+
+            return ProbeRun(
+                label=label,
+                scope=scope,
+                replied=True,
+                text=body,
+                path_len=payload.get("path_len"),
+            )
+
+        LOGGER.warning("No reply naming %s within %.0fs", self._node_name, timeout)
+        return ProbeRun(label=label, scope=scope, replied=False)
 
     def deliver(
         self,
