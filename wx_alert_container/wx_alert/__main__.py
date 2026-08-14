@@ -172,17 +172,19 @@ def run_radio_diagnostic(args) -> int:
         region = args.meshcore_scope_probe
         print(
             f"Probing region {region} on channel "
-            f"{args.meshcore_probe_channel}. Two messages will be sent: an "
-            "unscoped control, then the scoped test.\n"
+            f"{args.meshcore_probe_channel}. An unscoped control follows only "
+            "if the scoped probe draws no reply.\n"
         )
 
-        control, scoped = transport.probe_scope(
+        scoped, control = transport.probe_scope(
             region,
             channel_index=args.meshcore_probe_channel,
             timeout=args.meshcore_probe_timeout,
         )
 
-        for run in (control, scoped):
+        for run in (scoped, control):
+            if not run.ran:
+                continue
             print(f"{run.label}:")
             if run.replied:
                 print(f"  reply after {run.hops}")
@@ -191,7 +193,7 @@ def run_radio_diagnostic(args) -> int:
                 print(f"  no reply within {args.meshcore_probe_timeout:.0f}s")
             print()
 
-        ok, verdict = interpret_probe(control, scoped)
+        ok, verdict = interpret_probe(scoped, control)
         print(verdict)
 
         # A region that does not work is a failed check, not a failed run, but

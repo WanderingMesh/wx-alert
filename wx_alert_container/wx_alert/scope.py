@@ -109,6 +109,7 @@ class ProbeRun:
     replied: bool
     text: str | None = None
     path_len: int | None = None
+    ran: bool = True
 
     @property
     def hops(self) -> str:
@@ -126,40 +127,53 @@ class ProbeRun:
         return f"{self.path_len} hop(s)"
 
 
-def interpret_probe(control: ProbeRun, scoped: ProbeRun) -> tuple[bool, str]:
-    """Turn two probe legs into a verdict.
+def interpret_probe(scoped: ProbeRun, control: ProbeRun) -> tuple[bool, str]:
+    """Turn the probe legs into a verdict.
 
-    The control leg is what makes the scoped leg readable. Silence from a
-    scoped probe on its own has at least three explanations — no repeater
-    carries the region, the bot is down, the channel index is wrong — and
-    they are indistinguishable. Establishing first that the bot answers when
-    unscoped removes two of them.
+    The scoped leg is decisive on its own when it succeeds, so the control
+    only runs when it fails, purely to separate "nothing carries the region"
+    from "the bot never answers anybody".
+
+    That ordering is not cosmetic. Both legs send the same trigger word,
+    receiving clients drop repeated identical content, and whichever leg goes
+    second risks being swallowed. Sending the scoped leg first means the risk
+    lands on the control, where a suppressed reply produces an inconclusive
+    result rather than a region wrongly condemned.
     """
+    if scoped.replied:
+        if scoped.path_len == 0:
+            return True, (
+                f"{scoped.scope} was accepted, but this is weak evidence. The "
+                "reply came back direct, so the bot heard the transmission "
+                "itself and no repeater is known to have forwarded it. Re-run "
+                "from somewhere that needs a relay to reach the bot."
+            )
+
+        return True, (
+            f"{scoped.scope} works. The scoped probe was answered "
+            f"({scoped.hops}), so a repeater carrying the region relayed it. "
+            "Read the bot's reply above to confirm the region it saw matches."
+        )
+
+    if not control.ran:
+        return False, (
+            f"No reply to {scoped.scope}, and the control was not run, so "
+            "there is nothing to tell a dead region from a dead bot."
+        )
+
     if not control.replied:
         return False, (
-            "Inconclusive. The unscoped control got no reply either, so this "
-            "says nothing about the region. Check that the bot is up and that "
-            "the probe channel index is right, then run it again."
+            "Inconclusive. Neither leg was answered, so this says nothing "
+            "about the region. Either the bot is down or the channel index is "
+            "wrong — or the bot ignored the control as a repeat of the first "
+            "message, which is why silence here is not held against the "
+            "region. Verify the bot answers at all, then probe again."
         )
 
-    if not scoped.replied:
-        return False, (
-            f"{scoped.scope} does not work here. The control was answered "
-            f"({control.hops}) and the scoped probe was not, which means "
-            "nothing able to reach the bot carries that region. Alerts sent "
-            "under it would reach direct neighbours only."
-        )
-
-    if scoped.path_len == 0 and (control.path_len or 0) > 0:
-        return False, (
-            f"Weak evidence for {scoped.scope}. The reply came back direct "
-            "while the control was relayed, so the bot heard the transmission "
-            "itself and no repeater is known to have forwarded it. Re-run "
-            "from somewhere that needs a relay to reach the bot."
-        )
-
-    return True, (
-        f"{scoped.scope} works. The scoped probe was answered "
-        f"({scoped.hops}), so a repeater carrying the region relayed it. "
-        "Read the bot's reply below to confirm the region it saw matches."
+    return False, (
+        f"{scoped.scope} appears not to work here. The scoped probe went "
+        f"unanswered and the unscoped control was answered ({control.hops}), "
+        "which points at nothing on the path to the bot carrying that region. "
+        "Alerts sent under it would reach direct neighbours only. Worth one "
+        "repeat run before acting on it."
     )

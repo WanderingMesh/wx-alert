@@ -44,6 +44,9 @@ LOGGER = logging.getLogger("wx-alert")
 # rather than optimistic.
 _FALLBACK_NODE_NAME = "X" * 32
 
+# None is a meaningful scope value, so it cannot double as "argument omitted".
+_UNSET = object()
+
 # Longest the transport will hold a poll cycle open to satisfy minimum
 # transmission spacing.
 #
@@ -349,13 +352,20 @@ class MeshCoreTransport:
                 "leave [meshcore] SCOPE blank to transmit without one."
             )
 
-    def _describe_scope(self) -> str:
-        """How the scope should read in a log line."""
-        if self._scope is None:
+    def _describe_scope(self, scope: str | None | object = _UNSET) -> str:
+        """How a scope should read in a log line.
+
+        The key is included because the key, not the name, is what has to
+        match the repeaters. Printing it turns a spelling or case mismatch
+        from an invisible loss of coverage into two values to compare.
+        """
+        value = self._scope if scope is _UNSET else scope
+
+        if value is None:
             return "unset"
-        if self._scope == FORCE_UNSCOPED:
+        if value == FORCE_UNSCOPED:
             return "forced-unscoped"
-        return f"{self._scope} key={scope_key(self._scope)}"
+        return f"{value} key={scope_key(value)}"
 
     def _ensure_connected(self) -> None:
         if self._meshcore is None:
@@ -527,12 +537,25 @@ class MeshCoreTransport:
         channel_index: int,
         text: str = "test",
         timeout: float = 60.0,
+        gap: float = 45.0,
     ) -> tuple[ProbeRun, ProbeRun]:
-        """Send a probe unscoped, then scoped, and report what came back.
+        """Probe scoped first, then unscoped only if that drew no reply.
 
-        Both legs are needed. A scoped probe that goes unanswered has several
-        possible causes that look identical from here, and establishing that
-        the bot replies at all when unscoped eliminates most of them.
+        The scoped leg answers the question by itself when it succeeds. The
+        unscoped control exists solely to separate a region nothing carries
+        from a bot that answers nobody, so it is not worth sending unless the
+        scoped leg failed.
+
+        Ordering matters more than it looks. Both legs send the same trigger
+        word, and receiving clients drop repeated identical content — the
+        behaviour that alert repeats already carry n/N markers to work
+        around. Whichever leg goes second can be swallowed by that. Sending
+        the control second puts the risk where it does least harm: a
+        suppressed control reads as inconclusive, while a suppressed scoped
+        leg would condemn a region that works perfectly well.
+
+        The gap between legs gives the receiver's dedupe window time to
+        expire, for the same reason.
 
         The radio is put back to its own default scope afterwards, so a probe
         cannot leave the device stuck in a region nobody intended.
@@ -547,20 +570,35 @@ class MeshCoreTransport:
         )
 
         try:
-            control = self._probe_once(
-                label="unscoped control",
-                scope=FORCE_UNSCOPED,
-                channel_index=channel_index,
-                text=f"{text}",
-                timeout=timeout,
-            )
             scoped = self._probe_once(
                 label=region,
                 scope=region,
                 channel_index=channel_index,
-                text=f"{text}",
+                text=text,
                 timeout=timeout,
             )
+
+            if scoped.replied:
+                control = ProbeRun(
+                    label="unscoped control",
+                    scope=FORCE_UNSCOPED,
+                    replied=False,
+                    ran=False,
+                )
+            else:
+                LOGGER.info(
+                    "Waiting %.0fs before the control, so the receiver stops "
+                    "treating an identical message as a repeat",
+                    gap,
+                )
+                self._sleep(gap)
+                control = self._probe_once(
+                    label="unscoped control",
+                    scope=FORCE_UNSCOPED,
+                    channel_index=channel_index,
+                    text=text,
+                    timeout=timeout,
+                )
         finally:
             try:
                 # Back to the device default rather than to whatever the last
@@ -574,7 +612,7 @@ class MeshCoreTransport:
                 # may already be unhappy; the probe result still stands.
                 LOGGER.debug("Error cleaning up after the scope probe: %s", exc)
 
-        return control, scoped
+        return scoped, control
 
     def _probe_once(
         self,
@@ -593,7 +631,7 @@ class MeshCoreTransport:
         LOGGER.info(
             "Probing channel=%d scope=%s text=%r",
             channel_index,
-            label,
+            self._describe_scope(scope),
             text,
         )
 

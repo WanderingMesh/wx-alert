@@ -88,7 +88,7 @@ class FakeCommands:
         # Recorded separately so tests can assert what scope a message
         # actually went out under, not merely that the command was issued.
         self._radio.sent_scopes.append(self._radio.current_scope)
-        self._radio.maybe_answer(channel)
+        self._radio.maybe_answer(channel, message)
         return FakeEvent(EventType.OK)
 
 
@@ -114,14 +114,24 @@ class FakeRadio:
         self.carried_regions = set()
         self.bot_path_len = 2
         self.direct_to_bot = False
+        self.ignore_repeat_text = False
+        self.heard_text = set()
         self.fetching = False
         self.fetch_calls = []
         self._replies = []
 
-    def maybe_answer(self, channel):
+    def maybe_answer(self, channel, text=""):
         """Queue the bot's reply, if the transmission could have reached it."""
         if channel != self.bot_channel:
             return
+
+        # Receiving clients drop repeated identical content, which is the
+        # behaviour that made an earlier probe design report a working region
+        # as broken.
+        if self.ignore_repeat_text and text in self.heard_text:
+            return
+
+        self.heard_text.add(text)
 
         scope = self.current_scope
         unscoped = scope in (None, "*")
@@ -1267,27 +1277,65 @@ class TestScopeProbe:
         bot.carried_regions = {"#nnv"}
         transport = make_transport()
 
-        control, scoped = transport.probe_scope("#nnv", channel_index=3)
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
 
-        assert control.replied
         assert scoped.replied
-        ok, verdict = interpret_probe(control, scoped)
+        ok, verdict = interpret_probe(scoped, control)
         assert ok
         assert "#nnv works" in verdict
 
-    def test_a_region_nothing_carries_is_caught(self, make_transport, bot):
-        # The whole point: the control proves the bot is answering, so the
-        # scoped silence can only mean nothing forwarded it.
+    def test_a_working_region_costs_only_one_message(self, make_transport, bot):
+        # Both legs send the same trigger word, and a receiver that drops
+        # repeated identical content would swallow the second one. Not
+        # sending it at all is the only way that cannot skew the result.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        assert not control.ran
+        assert len(bot.sent) == 1
+
+    def test_the_scoped_leg_is_sent_first(self, make_transport, bot):
+        # This is the whole defect. With the control first, a receiver that
+        # ignores the repeat drops the scoped leg, and a region that works
+        # perfectly is reported broken.
         bot.carried_regions = set()
         transport = make_transport()
 
-        control, scoped = transport.probe_scope("#typo", channel_index=3)
+        transport.probe_scope("#nnv", channel_index=3)
 
-        assert control.replied
+        assert bot.sent_scopes == ["#nnv", "*"]
+
+    def test_a_receiver_that_ignores_repeats_cannot_condemn_a_region(
+        self, make_transport, bot
+    ):
+        # The failure that produced a wrong verdict in the field, from the
+        # other side: whichever leg goes second may be dropped, so it must be
+        # the one whose loss is survivable.
+        bot.carried_regions = {"#nnv"}
+        bot.ignore_repeat_text = True
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        ok, _ = interpret_probe(scoped, control)
+        assert ok
+
+    def test_a_region_nothing_carries_is_caught(self, make_transport, bot):
+        # The control proves the bot is answering, so the scoped silence
+        # points at the region.
+        bot.carried_regions = set()
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#typo", channel_index=3)
+
         assert not scoped.replied
-        ok, verdict = interpret_probe(control, scoped)
+        assert control.replied
+        ok, verdict = interpret_probe(scoped, control)
         assert not ok
-        assert "does not work here" in verdict
+        assert "appears not to work here" in verdict
 
     def test_a_silent_bot_is_reported_as_inconclusive(self, make_transport, bot):
         # Not as a bad region. Blaming the region here would send an operator
@@ -1295,9 +1343,9 @@ class TestScopeProbe:
         bot.bot_channel = None
         transport = make_transport()
 
-        control, scoped = transport.probe_scope("#nnv", channel_index=3)
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
 
-        ok, verdict = interpret_probe(control, scoped)
+        ok, verdict = interpret_probe(scoped, control)
         assert not ok
         assert "Inconclusive" in verdict
 
@@ -1308,22 +1356,23 @@ class TestScopeProbe:
         bot.direct_to_bot = True
         transport = make_transport()
 
-        control, scoped = transport.probe_scope("#nnv", channel_index=3)
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
 
         assert scoped.replied
         assert scoped.path_len == 0
-        # With the control also direct there is nothing to compare against, so
-        # this only asserts the hop count survives to the report.
         assert scoped.hops == "direct, no relay"
+        ok, verdict = interpret_probe(scoped, control)
+        assert ok
+        assert "weak evidence" in verdict
 
     def test_the_control_goes_out_unscoped(self, make_transport, bot):
-        bot.carried_regions = {"#nnv"}
+        bot.carried_regions = set()
         transport = make_transport(scope="#configured")
         transport.probe_scope("#nnv", channel_index=3)
 
-        # Including past a configured SCOPE, which would otherwise make the
-        # control test the operator's existing region instead of nothing.
-        assert bot.sent_scopes == ["*", "#nnv"]
+        # Past a configured SCOPE, which would otherwise make the control
+        # test the operator's existing region instead of nothing.
+        assert bot.sent_scopes == ["#nnv", "*"]
 
     def test_the_probe_uses_the_test_channel_not_the_alert_channel(
         self, make_transport, bot
@@ -1369,7 +1418,7 @@ class TestScopeProbe:
         bot.carried_regions = {"#nnv"}
         transport = make_transport()
 
-        _, scoped = transport.probe_scope("#nnv", channel_index=3)
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
 
         assert "scope: #nnv" in scoped.text
 

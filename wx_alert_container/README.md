@@ -593,14 +593,24 @@ channel's key cannot be recovered. The channel is read back after writing,
 because trusting the acknowledgement would resurface later as a bot that never
 answers.
 
-The probe sends **twice**: once unscoped, then once scoped to the candidate.
+The probe sends the **scoped** message first. If the bot answers, that settles
+it and nothing else is sent. Only when the scoped leg draws no reply does an
+unscoped control follow, to separate "nothing carries this region" from "the
+bot answers nobody". A probe that reports *inconclusive* is telling you the
+control failed too, so the region was never really tested.
 
-The unscoped leg is the control, and it is what makes the result readable.
-Silence from a scoped probe on its own has three explanations that look
-identical — nothing carries the region, the bot is down, the channel index is
-wrong — and establishing first that the bot answers unscoped removes two of
-them. A probe that reports *inconclusive* is telling you the control failed
-and the region was never actually tested.
+That order is load-bearing, and getting it wrong once already produced a
+confidently wrong answer. Both legs send the same trigger word, receiving
+clients drop repeated identical content — the same behaviour alert repeats
+carry `1/2` and `2/2` markers to work around — and whichever leg goes second
+can be swallowed by it. With the control first, a bot that ignores the repeat
+eats the scoped leg and a perfectly good region is reported broken. Sending
+the scoped leg first puts that risk on the control, where losing it downgrades
+the result to inconclusive instead of condemning the region. The probe also
+waits before the control for the same reason.
+
+The consequence worth remembering: a *positive* result is strong evidence, and
+a negative one is worth repeating before you act on it.
 
 Read the result in two parts. The verdict covers whether anything relayed the
 scoped message; the bot's own reply, printed verbatim, tells you which region
@@ -613,6 +623,10 @@ back direct while the control was relayed, the bot simply heard the
 transmission itself and no repeater is known to have forwarded it. That proves
 the radio accepted the region and nothing more. Probe from somewhere that
 needs a relay to reach the bot.
+
+On the Northern Nevada mesh, `nnv` is confirmed working: it resolves to key
+`4f1dac9ea4408c9a8e9759c9d80fbd67`, and a probe scoped to it was relayed to
+the test bot three hops out, which reported `Region: nnv` back.
 
 The probe restores the radio to its own default scope when it finishes,
 including after a failure, so it cannot leave the device stuck in a region
