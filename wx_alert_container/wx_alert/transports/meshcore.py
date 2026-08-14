@@ -415,17 +415,16 @@ class MeshCoreTransport:
 
     # -- diagnostics -------------------------------------------------------
 
-    def list_channels(self, limit: int = 16) -> list[tuple[int, str]]:
-        """Read back the channels the radio has configured.
+    def read_channels(self, limit: int = 16) -> list[tuple[int, str]]:
+        """Every readable channel slot, empty ones included.
 
-        Finding the index of a channel by name is otherwise guesswork, and
-        guessing wrong makes a probe fail for a reason that looks exactly like
-        the region being wrong.
+        Empty slots are kept because finding a free one is how a channel gets
+        added without destroying something already there.
         """
         from meshcore import EventType
 
         self._ensure_connected()
-        found: list[tuple[int, str]] = []
+        slots: list[tuple[int, str]] = []
 
         for index in range(limit):
             result = self._bridge.call(
@@ -436,11 +435,90 @@ class MeshCoreTransport:
             if result is None or result.type == EventType.ERROR:
                 continue
 
-            name = (result.payload or {}).get("channel_name", "")
-            if name:
-                found.append((index, name))
+            slots.append((index, (result.payload or {}).get("channel_name", "")))
 
-        return found
+        return slots
+
+    def list_channels(self, limit: int = 16) -> list[tuple[int, str]]:
+        """The channels the radio actually has configured.
+
+        Finding the index of a channel by name is otherwise guesswork, and
+        guessing wrong makes a probe fail for a reason that looks exactly like
+        the region being wrong.
+        """
+        return [(index, name) for index, name in self.read_channels(limit) if name]
+
+    def add_channel(
+        self,
+        name: str,
+        *,
+        slot: int | None = None,
+        limit: int = 16,
+    ) -> int:
+        """Add a hash-named channel, returning the slot it landed in.
+
+        Only names beginning with '#' are accepted. The firmware derives those
+        keys from the name itself, so every node that adds one arrives at the
+        same key with nothing shared out of band. A name without the '#' needs
+        a secret we have no way to guess, and inventing one would produce a
+        channel nobody else can read — which from here is indistinguishable
+        from a channel where nobody is talking.
+        """
+        from meshcore import EventType
+
+        if not name.startswith("#"):
+            raise TransportError(
+                f"channel name {name!r} must start with '#'. Only hash-named "
+                "channels can be derived from the name alone; a named channel "
+                "needs the shared secret its members already use."
+            )
+
+        self._ensure_connected()
+        slots = self.read_channels(limit)
+        occupied = {index: existing for index, existing in slots if existing}
+
+        for index, existing in occupied.items():
+            if existing == name:
+                LOGGER.info("Channel %s already present at index %d", name, index)
+                return index
+
+        if slot is None:
+            free = [index for index, existing in slots if not existing]
+            if not free:
+                raise TransportError(
+                    "the radio has no free channel slot; pass an explicit slot "
+                    "to overwrite one"
+                )
+            slot = free[0]
+        elif slot in occupied:
+            # Overwriting is a real thing to want, but never by accident: the
+            # displaced channel is gone with no way to recover its key.
+            raise TransportError(
+                f"channel slot {slot} already holds {occupied[slot]!r}; "
+                "choose a free slot or remove that channel first"
+            )
+
+        result = self._bridge.call(
+            self._meshcore.commands.set_channel(slot, name),
+            timeout=self._send_timeout,
+        )
+
+        if result is None or result.type == EventType.ERROR:
+            detail = getattr(result, "payload", "no response")
+            raise TransportError(f"radio refused to add {name!r}: {detail}")
+
+        # Read back rather than trust the acknowledgement: a channel that did
+        # not stick would show up later as a bot that never answers.
+        confirmed = dict(self.read_channels(limit)).get(slot, "")
+
+        if confirmed != name:
+            raise TransportError(
+                f"channel {name!r} did not stick in slot {slot}; the radio "
+                f"reports {confirmed!r}"
+            )
+
+        LOGGER.info("Added channel %s at index %d", name, slot)
+        return slot
 
     def probe_scope(
         self,

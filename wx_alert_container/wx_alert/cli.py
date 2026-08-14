@@ -443,7 +443,38 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="List the channels the radio has configured, and exit.",
     )
 
+    mesh.add_argument(
+        "--meshcore-add-channel",
+        metavar="NAME",
+        help=(
+            "Add a hash-named channel such as '#test' to the first free slot, "
+            "then exit. The key is derived from the name, so every node that "
+            "adds it agrees without sharing a secret. Names without a leading "
+            "'#' are refused: those need a secret this cannot guess."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-channel-slot",
+        type=int,
+        metavar="INDEX",
+        help=(
+            "Slot for --meshcore-add-channel. Defaults to the first free one. "
+            "An occupied slot is refused rather than overwritten."
+        ),
+    )
+
     args = parser.parse_args(argv)
+
+    if args.meshcore_channel_slot is not None and not args.meshcore_add_channel:
+        parser.error("--meshcore-channel-slot only applies to --meshcore-add-channel")
+
+    if args.meshcore_add_channel and not args.meshcore_add_channel.startswith("#"):
+        parser.error(
+            f"--meshcore-add-channel: {args.meshcore_add_channel!r} must start "
+            "with '#'. Only hash-named channels derive their key from the name; "
+            "any other channel needs the secret its members already share."
+        )
 
     if args.meshcore_scope_probe and args.meshcore_probe_channel is None:
         parser.error(
@@ -495,6 +526,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     for flag, wanted in (
         ("--meshcore-scope-probe", bool(args.meshcore_scope_probe)),
         ("--meshcore-channels", args.meshcore_channels),
+        ("--meshcore-add-channel", bool(args.meshcore_add_channel)),
     ):
         if wanted and not args.meshcore_port:
             parser.error(
@@ -508,7 +540,11 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Catching this here means an operator who mistypes a flag gets an error
     # rather than a container that polls NWS forever and delivers nothing.
-    diagnostic = bool(args.meshcore_scope_probe) or args.meshcore_channels
+    diagnostic = (
+        bool(args.meshcore_scope_probe)
+        or args.meshcore_channels
+        or bool(args.meshcore_add_channel)
+    )
 
     if not (
         args.ntfy

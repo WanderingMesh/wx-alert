@@ -152,6 +152,13 @@ def run_radio_diagnostic(args) -> int:
     transport = build_diagnostic_transport(args)
 
     try:
+        if args.meshcore_add_channel:
+            name = args.meshcore_add_channel
+            slot = transport.add_channel(name, slot=args.meshcore_channel_slot)
+            print(f"{name} is on channel index {slot}.")
+            print(f"Probe it with --meshcore-probe-channel {slot}")
+            return 0
+
         if args.meshcore_channels:
             channels = transport.list_channels()
             if not channels:
@@ -217,7 +224,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Also ahead of transport setup: these talk to the radio directly and have
     # nothing to do with delivering alerts.
-    if args.meshcore_channels or args.meshcore_scope_probe:
+    if (
+        args.meshcore_channels
+        or args.meshcore_scope_probe
+        or args.meshcore_add_channel
+    ):
         return run_radio_diagnostic(args)
 
     self_test = args.ntfy_test or args.meshcore_test

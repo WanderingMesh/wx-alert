@@ -503,19 +503,19 @@ a scope in production.
 
 ```ini
 [meshcore]
-SCOPE = nwnv
+SCOPE = nnv
 ```
 
-The leading `#` is optional; `nwnv` and `#nwnv` are the same region. Blank
+The leading `#` is optional; `nnv` and `#nnv` are the same region. Blank
 means unscoped.
 
-The key is a hash of the **exact** name, so `nwnv` and `NWNV` are different
+The key is a hash of the **exact** name, so `nnv` and `NNV` are different
 regions that look nearly identical in a config file. Match whatever your
 repeaters use, character for character. To make a mismatch diagnosable, the
 resolved key is logged at startup and on every transmission:
 
 ```
-MeshCore connected port=/dev/meshcore node='LNM-WXA' channel=1 scope=#nwnv key=0e2b...
+MeshCore connected port=/dev/meshcore node='LNM-WXA' channel=1 scope=#nnv key=0e2b...
 ```
 
 Compare that key against your repeater's region configuration. If the keys
@@ -553,7 +553,7 @@ from a wedge mid-run would quietly resume transmitting outside its region.
 To try a region without editing config:
 
 ```bash
-docker compose run --rm wx-alert --meshcore-scope nwnv --meshcore-test
+docker compose run --rm wx-alert --meshcore-scope nnv --meshcore-test
 ```
 
 That proves the radio accepts the region. It cannot prove anything will relay
@@ -573,10 +573,25 @@ probe at it:
 # Find the test channel's index
 docker compose run --rm wx-alert --meshcore-channels
 
+# Not there? Add it. Lands in the first free slot and prints the index.
+docker compose run --rm wx-alert --meshcore-add-channel '#test'
+
 # Probe a candidate region on it
 docker compose run --rm wx-alert \
-  --meshcore-scope-probe nwnv --meshcore-probe-channel 3
+  --meshcore-scope-probe nnv --meshcore-probe-channel 3
 ```
+
+Only names starting with `#` can be added this way, and the restriction is
+load-bearing. The firmware derives a hash-named channel's key from the name
+itself, so every node that adds `#test` arrives at the same key with nothing
+exchanged out of band. A channel without the `#` has a shared secret this
+cannot guess, and inventing one would create a channel no one else can read —
+which from here is indistinguishable from a channel where nobody is talking.
+
+An occupied slot is refused rather than overwritten, since the displaced
+channel's key cannot be recovered. The channel is read back after writing,
+because trusting the acknowledgement would resurface later as a bot that never
+answers.
 
 The probe sends **twice**: once unscoped, then once scoped to the candidate.
 
@@ -852,14 +867,14 @@ docker compose run --rm wx-alert --meshcore-test
 docker compose run --rm wx-alert --meshcore --once --meshcore-repeat 1
 
 # Try a region scope without editing config, and confirm the radio accepts it
-docker compose run --rm wx-alert --meshcore-scope nwnv --meshcore-test
+docker compose run --rm wx-alert --meshcore-scope nnv --meshcore-test
 
 # List the radio's channels, to find the one a probe bot listens on
 docker compose run --rm wx-alert --meshcore-channels
 
 # Check a region is actually relayed, using a bot that answers on channel 3
 docker compose run --rm wx-alert \
-  --meshcore-scope-probe nwnv --meshcore-probe-channel 3
+  --meshcore-scope-probe nnv --meshcore-probe-channel 3
 
 # Full alert text to stdout and to ntfy
 docker compose run --rm wx-alert --ntfy --loop --verbose
