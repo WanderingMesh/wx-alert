@@ -16,6 +16,7 @@ import pytest
 from wx_alert.app import prioritize, process_alerts
 from wx_alert.policy import StartupPolicy
 from wx_alert.ratelimit import RateLimiter, RelevanceFilter
+from wx_alert.scope import interpret_probe
 from wx_alert.state import AlertState
 from wx_alert.transports.base import DeliveryContext, DeliveryResult, TransportError
 
@@ -38,12 +39,43 @@ class FakeCommands:
     async def get_channel(self, index):
         from meshcore import EventType
 
+        # Firmware differs on what an unused slot reports. Some answer with an
+        # empty name, some refuse outright, and channel provisioning has to
+        # cope with both.
+        if index in self._radio.empty_slots and index not in self._radio.channels:
+            return FakeEvent(
+                EventType.CHANNEL_INFO,
+                {"channel_idx": index, "channel_name": ""},
+            )
+
         if index not in self._radio.channels:
             return FakeEvent(EventType.ERROR, {"reason": "no such channel"})
         return FakeEvent(
             EventType.CHANNEL_INFO,
             {"channel_idx": index, "channel_name": self._radio.channels[index]},
         )
+
+    async def set_channel(self, index, name, secret=None):
+        from meshcore import EventType
+
+        if self._radio.reject_channel_write:
+            return FakeEvent(EventType.ERROR, {"reason": "read only"})
+
+        # The firmware derives a hash-named channel's key from the name, so
+        # nothing else needs recording for the tests that matter here.
+        self._radio.channels[index] = name
+        return FakeEvent(EventType.OK)
+
+    async def set_flood_scope(self, scope, force_unscoped=False):
+        from meshcore import EventType
+
+        self._radio.scope_calls.append(scope)
+
+        if self._radio.reject_scope:
+            return FakeEvent(EventType.ERROR, {"reason": "unknown command"})
+
+        self._radio.current_scope = scope
+        return FakeEvent(EventType.OK)
 
     async def send_chan_msg(self, channel, message, timestamp=None):
         from meshcore import EventType
@@ -53,6 +85,10 @@ class FakeCommands:
             return FakeEvent(EventType.ERROR, {"reason": "tx queue full"})
 
         self._radio.sent.append((channel, message))
+        # Recorded separately so tests can assert what scope a message
+        # actually went out under, not merely that the command was issued.
+        self._radio.sent_scopes.append(self._radio.current_scope)
+        self._radio.maybe_answer(channel, message)
         return FakeEvent(EventType.OK)
 
 
@@ -62,8 +98,95 @@ class FakeRadio:
         self.commands = FakeCommands(self)
         self.channels = {0: "Public"}
         self.sent = []
+        self.sent_scopes = []
+        self.scope_calls = []
+        self.current_scope = None
+        self.reject_scope = False
         self.reject_next = False
+        self.empty_slots = set()
+        self.reject_channel_write = False
         self.disconnect_count = 0
+
+        # A model of the probe bot and the mesh between here and it. The bot
+        # answers only when something can carry the transmission to it, which
+        # is the behaviour the probe exists to detect.
+        self.bot_channel = None
+        self.carried_regions = set()
+        self.bot_path_len = 2
+        self.direct_to_bot = False
+        self.ignore_repeat_text = False
+        self.heard_text = set()
+        self.fetching = False
+        self.fetch_calls = []
+        self._replies = []
+
+    def maybe_answer(self, channel, text=""):
+        """Queue the bot's reply, if the transmission could have reached it."""
+        if channel != self.bot_channel:
+            return
+
+        # Receiving clients drop repeated identical content, which is the
+        # behaviour that made an earlier probe design report a working region
+        # as broken.
+        if self.ignore_repeat_text and text in self.heard_text:
+            return
+
+        self.heard_text.add(text)
+
+        scope = self.current_scope
+        unscoped = scope in (None, "*")
+
+        if not (unscoped or self.direct_to_bot or scope in self.carried_regions):
+            return
+
+        # A bot in earshot hears the transmission itself, so no repeater is
+        # involved and the reply comes back with no path.
+        relayed = not self.direct_to_bot
+        self._replies.append(
+            {
+                "channel_idx": channel,
+                "text": (
+                    f"{self.self_info['name']}, heard you. "
+                    f"path: whatever scope: {scope or 'none'}"
+                ),
+                "path_len": self.bot_path_len if relayed else 0,
+            }
+        )
+
+    async def start_auto_message_fetching(self):
+        self.fetching = True
+        self.fetch_calls.append("start")
+
+    async def stop_auto_message_fetching(self):
+        self.fetching = False
+        self.fetch_calls.append("stop")
+
+    def queue_chatter(self, channel, text, path_len=1):
+        """Someone else talking on the same channel."""
+        self._replies.append(
+            {"channel_idx": channel, "text": text, "path_len": path_len}
+        )
+
+    async def wait_for_event(self, event_type, filters=None, timeout=None):
+        from meshcore import EventType
+
+        if not self.fetching:
+            # Nothing collects the reply unless fetching was started, which is
+            # the bug this models rather than papers over.
+            return None
+
+        wanted = (filters or {}).get("channel_idx")
+
+        for index, reply in enumerate(self._replies):
+            if wanted is None or reply["channel_idx"] == wanted:
+                self._replies.pop(index)
+                return FakeEvent(EventType.CHANNEL_MSG_RECV, reply)
+
+        return None
+
+    def reboot(self):
+        """Model a hard reset: the send scope does not survive one."""
+        self.current_scope = None
 
     async def disconnect(self):
         self.disconnect_count += 1
@@ -119,7 +242,10 @@ def make_transport(radio, clock, monkeypatch):
 
     async def fake_create_serial(port, baud=115200, **kwargs):
         # The real create_serial returns None rather than raising when the
-        # device does not answer, which the transport relies on.
+        # device does not answer, which the transport relies on. A device node
+        # that is not there is a different case, and that one does raise.
+        if port == "/dev/missing":
+            raise OSError(2, f"could not open port {port}")
         return None if port == "/dev/absent" else radio
 
     monkeypatch.setattr(
@@ -992,3 +1118,419 @@ class TestMeshCoreHangRecovery:
         # actionable fault; the failed recovery attempt is a detail.
         with pytest.raises(TransportError, match="no response"):
             transport.start()
+
+
+class TestMeshCoreScope:
+    """Region scoping, which is optional and silent when unset."""
+
+    def test_an_unset_scope_never_touches_the_radio(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        # Not the same as forcing unscoped. An operator who set a default
+        # scope on the device chose it, and overriding that silently would be
+        # worse than inheriting it.
+        transport = make_transport()
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.scope_calls == []
+        assert radio.sent
+
+    def test_a_configured_scope_is_applied_before_transmitting(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        transport = make_transport(scope="#rno")
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.scope_calls
+        assert radio.sent_scopes == ["#rno"]
+
+    def test_the_scope_is_applied_at_connect(self, make_transport, radio):
+        # So a radio rejecting the scope fails startup, rather than at the
+        # first alert hours later.
+        transport = make_transport(scope="#rno")
+        transport.start()
+
+        assert radio.current_scope == "#rno"
+
+    def test_every_copy_of_a_burst_goes_out_scoped(
+        self, make_transport, radio, fresh_warning, now, no_repeat_delay
+    ):
+        transport = make_transport(scope="#rno", repeat_sends=3)
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.sent_scopes == ["#rno", "#rno", "#rno"]
+
+    def test_the_scope_is_reasserted_after_a_reboot(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        # A hard reset recovers a wedged radio but does not preserve the send
+        # scope. Without re-asserting, a recovered radio would quietly resume
+        # transmitting outside the region the operator asked for.
+        transport = make_transport(scope="#rno")
+        transport.start()
+        radio.reboot()
+
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.sent_scopes == ["#rno"]
+
+    def test_a_rejected_scope_fails_startup(self, make_transport, radio):
+        # Older firmware has no such command. Carrying on would transmit
+        # unscoped while the operator believed the traffic was contained.
+        radio.reject_scope = True
+        transport = make_transport(scope="#rno")
+
+        with pytest.raises(TransportError, match="1.12.0"):
+            transport.start()
+
+    def test_a_rejected_scope_never_transmits(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        radio.reject_scope = True
+        transport = make_transport(scope="#rno")
+
+        result, _detail = transport.deliver(
+            fresh_warning, DeliveryContext(False, now)
+        )
+
+        assert result is DeliveryResult.FAILED
+        assert radio.sent == []
+
+    def test_forced_unscoped_is_sent_to_the_radio(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        # Distinct from an unset scope: this one overrides a device default.
+        transport = make_transport(scope="*")
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.scope_calls[0] == "*"
+
+    def test_the_self_test_is_scoped_like_a_real_alert(
+        self, make_transport, radio
+    ):
+        transport = make_transport(scope="#rno")
+        transport.start()
+        transport.selftest()
+
+        assert radio.sent_scopes == ["#rno"]
+
+    def test_a_dry_run_never_opens_the_port_to_set_a_scope(
+        self, make_transport, radio, fresh_warning, now
+    ):
+        transport = make_transport(scope="#rno", port="/dev/absent", dry_run=True)
+        transport.start()
+        transport.deliver(fresh_warning, DeliveryContext(False, now))
+
+        assert radio.scope_calls == []
+
+
+class TestMissingSerialPort:
+    def test_an_absent_device_node_is_reported_not_raised_raw(
+        self, make_transport, monkeypatch
+    ):
+        recorded = []
+        monkeypatch.setattr(
+            "wx_alert.transports.meshcore.hard_reset",
+            lambda port, **kwargs: recorded.append(port),
+        )
+        transport = make_transport(port="/dev/missing")
+
+        with pytest.raises(TransportError, match="cannot open serial port"):
+            transport.start()
+
+        # No point resetting a radio that is not attached, and attempting it
+        # would replace the real fault with a confusing second one.
+        assert recorded == []
+
+
+class TestChannelListing:
+    """Finding the probe channel, which is otherwise guesswork."""
+
+    def test_configured_channels_are_reported_with_their_index(
+        self, make_transport, radio
+    ):
+        radio.channels = {0: "Public", 1: "rno-wx-alerts", 3: "test"}
+        transport = make_transport()
+
+        assert transport.list_channels() == [
+            (0, "Public"),
+            (1, "rno-wx-alerts"),
+            (3, "test"),
+        ]
+
+    def test_gaps_between_channels_are_skipped_not_stopped_at(
+        self, make_transport, radio
+    ):
+        # Stopping at the first empty slot would hide a test channel
+        # configured above one, which is exactly where operators put them.
+        radio.channels = {0: "Public", 7: "test"}
+        transport = make_transport()
+
+        assert transport.list_channels() == [(0, "Public"), (7, "test")]
+
+
+class TestScopeProbe:
+    """Validating a region against a bot that answers."""
+
+    @pytest.fixture
+    def bot(self, radio):
+        radio.channels = {0: "Public", 1: "rno-wx-alerts", 3: "test"}
+        radio.bot_channel = 3
+        return radio
+
+    def test_a_carried_region_is_confirmed(self, make_transport, bot):
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        ok, verdict = interpret_probe(scoped, control)
+        assert ok
+        assert "#nnv works" in verdict
+
+    def test_a_working_region_costs_only_one_message(self, make_transport, bot):
+        # Both legs send the same trigger word, and a receiver that drops
+        # repeated identical content would swallow the second one. Not
+        # sending it at all is the only way that cannot skew the result.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        assert not control.ran
+        assert len(bot.sent) == 1
+
+    def test_the_scoped_leg_is_sent_first(self, make_transport, bot):
+        # This is the whole defect. With the control first, a receiver that
+        # ignores the repeat drops the scoped leg, and a region that works
+        # perfectly is reported broken.
+        bot.carried_regions = set()
+        transport = make_transport()
+
+        transport.probe_scope("#nnv", channel_index=3)
+
+        assert bot.sent_scopes == ["#nnv", "*"]
+
+    def test_a_receiver_that_ignores_repeats_cannot_condemn_a_region(
+        self, make_transport, bot
+    ):
+        # The failure that produced a wrong verdict in the field, from the
+        # other side: whichever leg goes second may be dropped, so it must be
+        # the one whose loss is survivable.
+        bot.carried_regions = {"#nnv"}
+        bot.ignore_repeat_text = True
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        ok, _ = interpret_probe(scoped, control)
+        assert ok
+
+    def test_other_peoples_chatter_is_not_mistaken_for_a_reply(
+        self, make_transport, bot
+    ):
+        # A test channel carries conversations. Taking the first message to
+        # arrive as the answer reported a region as working on the strength
+        # of someone discussing repeater IDs.
+        bot.carried_regions = set()
+        bot.bot_channel = None
+        transport = make_transport()
+        transport.start()
+        bot.queue_chatter(3, "KW-T096: it identifies repeaters by key prefix")
+
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
+
+        assert not scoped.replied
+
+    def test_a_reply_is_found_despite_traffic_ahead_of_it(
+        self, make_transport, bot
+    ):
+        # Ignoring chatter must mean reading past it, not giving up at it.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+        transport.start()
+        bot.queue_chatter(3, "KW-T096: unrelated")
+        bot.queue_chatter(3, "someone else: also unrelated")
+
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        assert "WX-Reno" in scoped.text
+
+    def test_a_region_nothing_carries_is_caught(self, make_transport, bot):
+        # The control proves the bot is answering, so the scoped silence
+        # points at the region.
+        bot.carried_regions = set()
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#typo", channel_index=3)
+
+        assert not scoped.replied
+        assert control.replied
+        ok, verdict = interpret_probe(scoped, control)
+        assert not ok
+        assert "appears not to work here" in verdict
+
+    def test_a_silent_bot_is_reported_as_inconclusive(self, make_transport, bot):
+        # Not as a bad region. Blaming the region here would send an operator
+        # renaming things to fix a bot that is simply switched off.
+        bot.bot_channel = None
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        ok, verdict = interpret_probe(scoped, control)
+        assert not ok
+        assert "Inconclusive" in verdict
+
+    def test_a_direct_reply_is_not_treated_as_proof(self, make_transport, bot):
+        # A bot in earshot answers whatever the scope, so a zero-hop reply
+        # says the radio accepted the scope and nothing about coverage.
+        bot.carried_regions = {"#nnv"}
+        bot.direct_to_bot = True
+        transport = make_transport()
+
+        scoped, control = transport.probe_scope("#nnv", channel_index=3)
+
+        assert scoped.replied
+        assert scoped.path_len == 0
+        assert scoped.hops == "direct, no relay"
+        ok, verdict = interpret_probe(scoped, control)
+        assert ok
+        assert "weak evidence" in verdict
+
+    def test_the_control_goes_out_unscoped(self, make_transport, bot):
+        bot.carried_regions = set()
+        transport = make_transport(scope="#configured")
+        transport.probe_scope("#nnv", channel_index=3)
+
+        # Past a configured SCOPE, which would otherwise make the control
+        # test the operator's existing region instead of nothing.
+        assert bot.sent_scopes == ["#nnv", "*"]
+
+    def test_the_probe_uses_the_test_channel_not_the_alert_channel(
+        self, make_transport, bot
+    ):
+        transport = make_transport(channel_index=1)
+        transport.probe_scope("#nnv", channel_index=3)
+
+        assert [channel for channel, _ in bot.sent] == [3, 3]
+
+    def test_the_radio_is_left_on_its_own_default(self, make_transport, bot):
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+        transport.probe_scope("#nnv", channel_index=3)
+
+        # A probe that left the radio stuck in the region it was testing would
+        # quietly change what every later transmission does.
+        assert bot.scope_calls[-1] is None
+        assert bot.current_scope is None
+
+    def test_cleanup_happens_even_when_a_leg_fails(self, make_transport, bot):
+        transport = make_transport()
+        transport.start()
+        bot.reject_next = True
+
+        with pytest.raises(TransportError):
+            transport.probe_scope("#nnv", channel_index=3)
+
+        assert bot.scope_calls[-1] is None
+        assert bot.fetch_calls[-1] == "stop"
+
+    def test_replies_are_collected_not_merely_announced(self, make_transport, bot):
+        # Incoming messages arrive as a notification the client has to act on.
+        # Without starting the fetcher the reply is announced and dropped.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+        transport.probe_scope("#nnv", channel_index=3)
+
+        assert "start" in bot.fetch_calls
+
+    def test_the_bot_reply_text_reaches_the_operator(self, make_transport, bot):
+        # The bot's own account of what it saw is the authoritative half of
+        # this, and no parser here could keep up with its format.
+        bot.carried_regions = {"#nnv"}
+        transport = make_transport()
+
+        scoped, _ = transport.probe_scope("#nnv", channel_index=3)
+
+        assert "scope: #nnv" in scoped.text
+
+
+class TestAddingAChannel:
+    """Provisioning the test channel a probe needs."""
+
+    def test_a_hash_named_channel_lands_in_the_first_free_slot(
+        self, make_transport, radio
+    ):
+        radio.channels = {0: "Public", 1: "rno-wx-alerts"}
+        radio.empty_slots = {2, 3, 4}
+        transport = make_transport()
+
+        assert transport.add_channel("#test") == 2
+        assert radio.channels[2] == "#test"
+
+    def test_a_name_without_a_hash_is_refused(self, make_transport, radio):
+        # Deriving a key for it would invent one nobody else has, and a
+        # channel nobody else can read looks exactly like a channel where
+        # nobody is talking.
+        transport = make_transport()
+
+        with pytest.raises(TransportError, match="must start with '#'"):
+            transport.add_channel("test")
+
+        assert 1 not in radio.channels
+
+    def test_an_existing_channel_is_found_rather_than_duplicated(
+        self, make_transport, radio
+    ):
+        radio.channels = {0: "Public", 5: "#test"}
+        radio.empty_slots = {1, 2}
+        transport = make_transport()
+
+        assert transport.add_channel("#test") == 5
+        assert 1 not in radio.channels
+
+    def test_an_occupied_slot_is_never_overwritten_silently(
+        self, make_transport, radio
+    ):
+        # The displaced channel's key cannot be recovered afterwards.
+        radio.channels = {0: "Public", 3: "#neighbours"}
+        transport = make_transport()
+
+        with pytest.raises(TransportError, match="already holds"):
+            transport.add_channel("#test", slot=3)
+
+        assert radio.channels[3] == "#neighbours"
+
+    def test_firmware_that_hides_free_slots_still_accepts_an_explicit_one(
+        self, make_transport, radio
+    ):
+        # Some firmware refuses to read an unused slot, so none can be found
+        # automatically. Naming one has to keep working.
+        radio.channels = {0: "Public"}
+        radio.empty_slots = set()
+        transport = make_transport()
+
+        with pytest.raises(TransportError, match="no free channel slot"):
+            transport.add_channel("#test")
+
+        assert transport.add_channel("#test", slot=4) == 4
+
+    def test_a_channel_that_does_not_stick_is_reported(self, make_transport, radio):
+        # Trusting the acknowledgement would surface later as a bot that never
+        # answers, which is the hardest thing here to diagnose.
+        radio.channels = {0: "Public"}
+        radio.empty_slots = {1}
+        transport = make_transport()
+        transport.start()
+        radio.reject_channel_write = True
+
+        with pytest.raises(TransportError, match="refused to add"):
+            transport.add_channel("#test")

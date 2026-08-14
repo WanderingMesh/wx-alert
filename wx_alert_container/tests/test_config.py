@@ -234,6 +234,30 @@ class TestMeshCoreConfiguration:
         )
         assert mesh.repeat_sends == 1
 
+    def test_scope_defaults_to_unset(self):
+        # Absent means the radio's own scope state is left alone, which is
+        # what every deployment predating this option expects.
+        mesh = load_meshcore_configuration(parse(MINIMAL + "\n[meshcore]\n"))
+        assert mesh.scope is None
+
+    def test_a_blank_scope_is_unset(self):
+        mesh = load_meshcore_configuration(
+            parse(MINIMAL + "\n[meshcore]\nSCOPE =\n")
+        )
+        assert mesh.scope is None
+
+    def test_a_scope_gains_its_marker(self):
+        mesh = load_meshcore_configuration(
+            parse(MINIMAL + "\n[meshcore]\nSCOPE = rno\n")
+        )
+        assert mesh.scope == "#rno"
+
+    def test_scope_case_survives_the_config_file(self):
+        mesh = load_meshcore_configuration(
+            parse(MINIMAL + "\n[meshcore]\nSCOPE = NorthNV\n")
+        )
+        assert mesh.scope == "#NorthNV"
+
     @pytest.mark.parametrize(
         ("option", "value"),
         [
@@ -245,6 +269,8 @@ class TestMeshCoreConfiguration:
             ("MAX_SENDS_PER_HOUR", "-1"),
             ("MIN_SECONDS_BETWEEN_SENDS", "-1"),
             ("ENABLED", "maybe"),
+            ("SCOPE", "northern nevada"),
+            ("SCOPE", "0"),
         ],
     )
     def test_rejects_invalid_values(self, option, value):

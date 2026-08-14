@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .nws import EVENT_CLASS_RANK, SEVERITY_RANK
+from .scope import normalize_scope
 from .state import DEFAULT_RETENTION_DAYS, DEFAULT_STATE_FILE
 from .text import clean_optional
 from .zones import parse_zone_list
@@ -87,6 +88,11 @@ class MeshCoreConfiguration:
     port: str | None
     baud: int
     channel_index: int
+
+    # None means the radio's own scope state is left untouched, which is not
+    # the same as forcing unscoped. See scope.py.
+    scope: str | None
+
     minimum_class: str
     minimum_severity: str
     min_interval_seconds: int
@@ -230,6 +236,13 @@ def load_meshcore_configuration(
             "[meshcore] CHANNEL_INDEX must be between 0 and 255"
         )
 
+    try:
+        scope = normalize_scope(
+            parser.get("meshcore", "SCOPE", fallback=""), "[meshcore] SCOPE"
+        )
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
     baud = _read_int(parser, "meshcore", "BAUD", DEFAULT_MESHCORE_BAUD)
     if baud <= 0:
         raise ConfigurationError("[meshcore] BAUD must be a positive integer")
@@ -273,6 +286,7 @@ def load_meshcore_configuration(
         port=port,
         baud=baud,
         channel_index=channel_index,
+        scope=scope,
         minimum_class=minimum_class,
         minimum_severity=minimum_severity,
         min_interval_seconds=validate_nonnegative(

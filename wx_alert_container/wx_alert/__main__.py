@@ -14,6 +14,7 @@ from .cli import parse_arguments
 from .policy import StartupPolicy
 from .radio import RadioResetError, hard_reset
 from .ratelimit import RateLimiter, RelevanceFilter
+from .scope import interpret_probe
 from .shutdown import install_signal_handlers
 from .state import StateError, load_state
 from .transports.base import Transport, TransportError
@@ -76,6 +77,7 @@ def build_transports(
                 port=args.meshcore_port or "",
                 baud=mesh.baud,
                 channel_index=args.meshcore_channel,
+                scope=args.meshcore_scope,
                 relevance=relevance,
                 rate_limiter=RateLimiter(
                     min_interval_seconds=mesh.min_interval_seconds,
@@ -112,6 +114,98 @@ def build_transports(
     return transports
 
 
+def build_diagnostic_transport(args) -> MeshCoreTransport:
+    """A transport built only to talk to the radio.
+
+    The filtering and rate limiting the delivery path needs are irrelevant to
+    a diagnostic and would only get in its way, so they are stubbed rather
+    than read from the operator's configuration.
+    """
+    mesh = args.meshcore_config
+
+    return MeshCoreTransport(
+        port=args.meshcore_port or "",
+        baud=mesh.baud,
+        channel_index=args.meshcore_channel,
+        # The probe sets its own scope on each leg; inheriting the configured
+        # one would contaminate the control.
+        scope=None,
+        relevance=RelevanceFilter(
+            minimum_class=mesh.minimum_class,
+            minimum_severity=mesh.minimum_severity,
+        ),
+        rate_limiter=RateLimiter(min_interval_seconds=0, max_per_hour=0),
+        startup_policy=StartupPolicy(
+            max_age_seconds=0,
+            always_notify_warnings=False,
+        ),
+        connect_timeout=mesh.connect_timeout,
+        send_timeout=mesh.send_timeout,
+        auto_reset=mesh.auto_reset,
+        reset_settle=mesh.reset_settle,
+        debug=args.verbose,
+    )
+
+
+def run_radio_diagnostic(args) -> int:
+    """Run --meshcore-channels or --meshcore-scope-probe, then exit."""
+    transport = build_diagnostic_transport(args)
+
+    try:
+        if args.meshcore_add_channel:
+            name = args.meshcore_add_channel
+            slot = transport.add_channel(name, slot=args.meshcore_channel_slot)
+            print(f"{name} is on channel index {slot}.")
+            print(f"Probe it with --meshcore-probe-channel {slot}")
+            return 0
+
+        if args.meshcore_channels:
+            channels = transport.list_channels()
+            if not channels:
+                print("The radio reports no configured channels.")
+                return STATUS_DELIVERY_FAILURE
+            print("Channels configured on the radio:")
+            for index, name in channels:
+                print(f"  {index:>3}  {name}")
+            return 0
+
+        region = args.meshcore_scope_probe
+        print(
+            f"Probing region {region} on channel "
+            f"{args.meshcore_probe_channel}. An unscoped control follows only "
+            "if the scoped probe draws no reply.\n"
+        )
+
+        scoped, control = transport.probe_scope(
+            region,
+            channel_index=args.meshcore_probe_channel,
+            timeout=args.meshcore_probe_timeout,
+        )
+
+        for run in (scoped, control):
+            if not run.ran:
+                continue
+            print(f"{run.label}:")
+            if run.replied:
+                print(f"  reply after {run.hops}")
+                print(f"  {run.text}")
+            else:
+                print(f"  no reply within {args.meshcore_probe_timeout:.0f}s")
+            print()
+
+        ok, verdict = interpret_probe(scoped, control)
+        print(verdict)
+
+        # A region that does not work is a failed check, not a failed run, but
+        # a non-zero exit lets this be scripted.
+        return 0 if ok else STATUS_DELIVERY_FAILURE
+    except TransportError as exc:
+        LOGGER.error("Radio diagnostic failed error=%s", exc)
+        return STATUS_DELIVERY_FAILURE
+    finally:
+        transport.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = parse_arguments(argv)
@@ -129,6 +223,15 @@ def main(argv: list[str] | None = None) -> int:
             return STATUS_DELIVERY_FAILURE
         LOGGER.info("Radio reset issued; reconnect with --meshcore-test to verify")
         return 0
+
+    # Also ahead of transport setup: these talk to the radio directly and have
+    # nothing to do with delivering alerts.
+    if (
+        args.meshcore_channels
+        or args.meshcore_scope_probe
+        or args.meshcore_add_channel
+    ):
+        return run_radio_diagnostic(args)
 
     self_test = args.ntfy_test or args.meshcore_test
     mode = "self-test" if self_test else ("polling" if args.loop else "once")

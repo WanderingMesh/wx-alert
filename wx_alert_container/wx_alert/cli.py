@@ -25,6 +25,7 @@ from .config import (
     validate_nonnegative,
     validate_radius_km,
 )
+from .scope import FORCE_UNSCOPED, normalize_scope
 from .text import clean_optional
 from .zones import parse_zone_list
 
@@ -61,6 +62,13 @@ def latitude_value(value: str) -> float:
 
 def longitude_value(value: str) -> float:
     return _argparse_wrapper(lambda v: validate_longitude(float(v)))(value)
+
+
+def scope_value(value: str) -> str | None:
+    # argparse already prefixes its own errors with the flag, so naming a
+    # specific one here would misattribute the failure the moment a second
+    # flag reuses this type.
+    return _argparse_wrapper(lambda v: normalize_scope(v, "region name"))(value)
 
 
 def ntfy_server_url(value: str) -> str:
@@ -349,6 +357,18 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     mesh.add_argument(
+        "--meshcore-scope",
+        type=scope_value,
+        default=config.meshcore.scope,
+        metavar="REGION",
+        help=(
+            "Region to scope transmissions to. An empty value leaves the "
+            "radio's own scope alone; '*' forces unscoped. Configured "
+            f"default: {config.meshcore.scope or 'unset'}."
+        ),
+    )
+
+    mesh.add_argument(
         "--meshcore-repeat",
         type=int,
         default=config.meshcore.repeat_sends,
@@ -387,7 +407,87 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    mesh.add_argument(
+        "--meshcore-scope-probe",
+        type=scope_value,
+        metavar="REGION",
+        help=(
+            "Test whether a region is usable, then exit. Sends a probe to the "
+            "test channel unscoped, then scoped to REGION, and reports what "
+            "came back. The unscoped leg is the control: without it, silence "
+            "from the scoped leg cannot be told apart from a bot that is down."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-probe-channel",
+        type=int,
+        metavar="INDEX",
+        help=(
+            "Channel index the probe bot listens on. Required by "
+            "--meshcore-scope-probe. Use --meshcore-channels to find it."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-probe-timeout",
+        type=nonnegative_seconds,
+        default=60,
+        metavar="SECONDS",
+        help="How long to wait for each probe reply. Default: 60.",
+    )
+
+    mesh.add_argument(
+        "--meshcore-channels",
+        action="store_true",
+        help="List the channels the radio has configured, and exit.",
+    )
+
+    mesh.add_argument(
+        "--meshcore-add-channel",
+        metavar="NAME",
+        help=(
+            "Add a hash-named channel such as '#test' to the first free slot, "
+            "then exit. The key is derived from the name, so every node that "
+            "adds it agrees without sharing a secret. Names without a leading "
+            "'#' are refused: those need a secret this cannot guess."
+        ),
+    )
+
+    mesh.add_argument(
+        "--meshcore-channel-slot",
+        type=int,
+        metavar="INDEX",
+        help=(
+            "Slot for --meshcore-add-channel. Defaults to the first free one. "
+            "An occupied slot is refused rather than overwritten."
+        ),
+    )
+
     args = parser.parse_args(argv)
+
+    if args.meshcore_channel_slot is not None and not args.meshcore_add_channel:
+        parser.error("--meshcore-channel-slot only applies to --meshcore-add-channel")
+
+    if args.meshcore_add_channel and not args.meshcore_add_channel.startswith("#"):
+        parser.error(
+            f"--meshcore-add-channel: {args.meshcore_add_channel!r} must start "
+            "with '#'. Only hash-named channels derive their key from the name; "
+            "any other channel needs the secret its members already share."
+        )
+
+    if args.meshcore_scope_probe and args.meshcore_probe_channel is None:
+        parser.error(
+            "--meshcore-scope-probe needs --meshcore-probe-channel: the probe "
+            "bot listens on the test channel, not the alert channel. Run "
+            "--meshcore-channels to list them."
+        )
+
+    if args.meshcore_scope_probe == FORCE_UNSCOPED:
+        parser.error(
+            "--meshcore-scope-probe needs a region name to test; '*' means "
+            "unscoped, which is what the probe already sends as its control"
+        )
 
     if args.ntfy and args.ntfy_test:
         parser.error("--ntfy and --ntfy-test cannot be used together")
@@ -421,13 +521,38 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "required by --meshcore-reset"
         )
 
+    # Both talk to the radio directly rather than through the delivery path,
+    # so neither can fall back to a dry run.
+    for flag, wanted in (
+        ("--meshcore-scope-probe", bool(args.meshcore_scope_probe)),
+        ("--meshcore-channels", args.meshcore_channels),
+        ("--meshcore-add-channel", bool(args.meshcore_add_channel)),
+    ):
+        if wanted and not args.meshcore_port:
+            parser.error(
+                "[meshcore] PORT in the config file, or --meshcore-port, is "
+                f"required by {flag}"
+            )
+
     # --meshcore-test and --ntfy-test deliberately combine: verifying that a
     # radio failure still leaves ntfy working requires exercising both in the
     # same run.
 
     # Catching this here means an operator who mistypes a flag gets an error
     # rather than a container that polls NWS forever and delivers nothing.
-    if not (args.ntfy or args.ntfy_test or meshcore_wanted or args.verbose):
+    diagnostic = (
+        bool(args.meshcore_scope_probe)
+        or args.meshcore_channels
+        or bool(args.meshcore_add_channel)
+    )
+
+    if not (
+        args.ntfy
+        or args.ntfy_test
+        or meshcore_wanted
+        or args.verbose
+        or diagnostic
+    ):
         LOGGER.warning(
             "No transport is enabled; alerts will only be printed to stdout"
         )

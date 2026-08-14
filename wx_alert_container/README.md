@@ -471,6 +471,173 @@ the entire burst on the next cycle — producing more duplicates, not fewer.
 
 ---
 
+## Region scoping
+
+Optional, and off unless you set it. `[meshcore] SCOPE` restricts which
+repeaters will relay these alerts.
+
+### What a scope actually does
+
+A MeshCore region is a name that hashes to a 16-byte transport key. Scoping a
+message does **not** filter anything at this end. It makes the packet
+forwardable only by repeaters configured with that region; every repeater
+without it drops the packet rather than relaying it.
+
+That inverts what the word suggests. A narrow scope does not deliver to a
+smaller area — it delivers to whatever part of that area happens to be covered
+by correctly configured repeaters.
+
+### The failure mode to understand before switching this on
+
+**Scope to a region no repeater in range carries, and the alert goes nowhere.**
+Direct neighbours still hear the transmission, nothing forwards it, and no
+error appears anywhere. The radio reports a successful send, the logs look
+normal, and coverage has silently collapsed to line of sight.
+
+So: pick a region broad enough to cover the whole area the alerts describe.
+For a deployment covering northwestern Nevada, that means a regional name
+rather than a single town. Confirm reception on a distant node before trusting
+a scope in production.
+
+### Setting it
+
+```ini
+[meshcore]
+SCOPE = nnv
+```
+
+The leading `#` is optional; `nnv` and `#nnv` are the same region. Blank
+means unscoped.
+
+The key is a hash of the **exact** name, so `nnv` and `NNV` are different
+regions that look nearly identical in a config file. Match whatever your
+repeaters use, character for character. To make a mismatch diagnosable, the
+resolved key is logged at startup and on every transmission:
+
+```
+MeshCore connected port=/dev/meshcore node='LNM-WXA' channel=1 scope=#nnv key=0e2b...
+```
+
+Compare that key against your repeater's region configuration. If the keys
+differ, the names differ, however alike they look.
+
+### Blank versus forced-unscoped
+
+These are different, and the difference only shows on a radio with a default
+scope set on the device itself:
+
+| `SCOPE` | Behaviour |
+|---|---|
+| blank | The radio's scope state is not touched. A device default is respected. |
+| `*` | Explicitly unscoped, overriding any device default. |
+| a name | Scoped to that region. |
+
+Blank is the default because it cannot change what an existing deployment
+does, and because silently overriding a setting someone deliberately made on
+the radio would be worse than inheriting it.
+
+### When it fails
+
+Region scoping needs MeshCore firmware **1.12.0 or newer**. If a scope is
+configured and the radio rejects the command, the container refuses to start.
+That is deliberate: the alternative is transmitting mesh-wide while the
+operator believes the traffic is contained, and a warning in a log nobody
+reads does not prevent that. With `SCOPE` blank the command is never issued,
+so older firmware is unaffected.
+
+The scope is device state rather than part of the message, so it is asserted
+after connecting *and* before every transmission. A hard reset reboots the
+radio and does not preserve it — without re-asserting, a radio that recovered
+from a wedge mid-run would quietly resume transmitting outside its region.
+
+To try a region without editing config:
+
+```bash
+docker compose run --rm wx-alert --meshcore-scope nnv --meshcore-test
+```
+
+That proves the radio accepts the region. It cannot prove anything will relay
+it, which is the part that matters. For that, see below.
+
+### Validating a region before you trust it
+
+`--meshcore-test` transmits and stops. Nothing comes back, so a region that no
+repeater carries passes it exactly like one that works. Checking coverage
+needs something at the far end that answers.
+
+Many meshes run a test channel with a bot that replies to `test` with the path
+the message took and the scope it arrived under. If yours does, point the
+probe at it:
+
+```bash
+# Find the test channel's index
+docker compose run --rm wx-alert --meshcore-channels
+
+# Not there? Add it. Lands in the first free slot and prints the index.
+docker compose run --rm wx-alert --meshcore-add-channel '#test'
+
+# Probe a candidate region on it
+docker compose run --rm wx-alert \
+  --meshcore-scope-probe nnv --meshcore-probe-channel 3
+```
+
+Only names starting with `#` can be added this way, and the restriction is
+load-bearing. The firmware derives a hash-named channel's key from the name
+itself, so every node that adds `#test` arrives at the same key with nothing
+exchanged out of band. A channel without the `#` has a shared secret this
+cannot guess, and inventing one would create a channel no one else can read —
+which from here is indistinguishable from a channel where nobody is talking.
+
+An occupied slot is refused rather than overwritten, since the displaced
+channel's key cannot be recovered. The channel is read back after writing,
+because trusting the acknowledgement would resurface later as a bot that never
+answers.
+
+The probe sends the **scoped** message first. If the bot answers, that settles
+it and nothing else is sent. Only when the scoped leg draws no reply does an
+unscoped control follow, to separate "nothing carries this region" from "the
+bot answers nobody". A probe that reports *inconclusive* is telling you the
+control failed too, so the region was never really tested.
+
+That order is load-bearing, and getting it wrong once already produced a
+confidently wrong answer. Both legs send the same trigger word, receiving
+clients drop repeated identical content — the same behaviour alert repeats
+carry `1/2` and `2/2` markers to work around — and whichever leg goes second
+can be swallowed by it. With the control first, a bot that ignores the repeat
+eats the scoped leg and a perfectly good region is reported broken. Sending
+the scoped leg first puts that risk on the control, where losing it downgrades
+the result to inconclusive instead of condemning the region. The probe also
+waits before the control for the same reason.
+
+The consequence worth remembering: a *positive* result is strong evidence, and
+a negative one is worth repeating before you act on it.
+
+Read the result in two parts. The verdict covers whether anything relayed the
+scoped message; the bot's own reply, printed verbatim, tells you which region
+it saw. Those answer different questions, and both need to be right: a bot
+that replies but reports no scope means the radio is not applying one, whatever
+the hop count says.
+
+One case is deliberately *not* treated as success. If the scoped reply comes
+back direct while the control was relayed, the bot simply heard the
+transmission itself and no repeater is known to have forwarded it. That proves
+the radio accepted the region and nothing more. Probe from somewhere that
+needs a relay to reach the bot.
+
+On the Northern Nevada mesh, `nnv` is confirmed working: it resolves to key
+`4f1dac9ea4408c9a8e9759c9d80fbd67`, and a probe scoped to it was relayed to
+the test bot three hops out, which reported `Region: nnv` back.
+
+The probe restores the radio to its own default scope when it finishes,
+including after a failure, so it cannot leave the device stuck in a region
+nobody intended. It exits non-zero when the region does not check out, so it
+can be scripted.
+
+Neither flag runs alerts: both talk to the radio and exit. Both need the radio,
+so stop the running container first.
+
+---
+
 ## Persistent state
 
 `/data/notified-alerts.json` records what has been delivered, per transport.
@@ -712,6 +879,16 @@ docker compose run --rm wx-alert --meshcore-test
 
 # Transmit each message once instead of twice, for this run only
 docker compose run --rm wx-alert --meshcore --once --meshcore-repeat 1
+
+# Try a region scope without editing config, and confirm the radio accepts it
+docker compose run --rm wx-alert --meshcore-scope nnv --meshcore-test
+
+# List the radio's channels, to find the one a probe bot listens on
+docker compose run --rm wx-alert --meshcore-channels
+
+# Check a region is actually relayed, using a bot that answers on channel 3
+docker compose run --rm wx-alert \
+  --meshcore-scope-probe nnv --meshcore-probe-channel 3
 
 # Full alert text to stdout and to ntfy
 docker compose run --rm wx-alert --ntfy --loop --verbose
