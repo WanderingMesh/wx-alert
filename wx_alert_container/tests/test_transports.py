@@ -393,7 +393,8 @@ class TestMeshCoreDelivery:
         assert "transmitted" in detail
         channel, message = radio.sent[-1]
         assert channel == 0
-        assert "Flash Flood Warning" in message
+        # The product name goes out abbreviated; see abbrev.NAME_TERMS.
+        assert message.startswith("Flash Flood Wrn")
 
     def test_the_message_never_exceeds_the_budget(self, make_transport, radio,
                                                   fresh_warning, now):
@@ -751,8 +752,8 @@ class TestMeshCoreSurvivesARestartMidEvent:
         transmitted = [message for _channel, message in radio.sent]
         # Loudest first: the Extreme tornado warning takes the airtime ahead of
         # the flash flood warning, and both go out in the one cycle.
-        assert "Tornado Warning" in transmitted[0]
-        assert any("Flash Flood Warning" in message for message in transmitted)
+        assert "Tornado Wrn" in transmitted[0]
+        assert any("Flash Flood Wrn" in message for message in transmitted)
 
     def test_the_stale_watch_is_settled_and_the_warnings_are_not_lost(
         self, transport, radio, batch, args, now
@@ -768,7 +769,7 @@ class TestMeshCoreSurvivesARestartMidEvent:
         # The watch is genuinely old news and stays suppressed, terminally.
         watch = batch[2]
         assert state.is_settled(watch, "meshcore")
-        assert not any("Flood Watch" in message for _c, message in radio.sent)
+        assert not any("Flood Wtch" in message for _c, message in radio.sent)
 
         # The warnings were delivered, so they are settled for the right
         # reason rather than quietly written off.

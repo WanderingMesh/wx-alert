@@ -290,8 +290,9 @@ docker compose run --rm wx-alert \
 ```
 
 ```text
-INFO MeshCore dry-run channel=0 bytes=124/141 text='Flash Flood Warning: Washoe
-County, til Thu 21:00. Move to higher ground now. Avoid flooded roadways.'
+INFO MeshCore dry-run channel=0 bytes=127/141 text='Tornado Wrn: Lyon/Storey/Washoe
+til 14:15. TAKE COVER NOW! Tornado 7 mi E of Lockwood, moving E at 15 mph. Nr
+Derby Dam, 13:30.'
 ```
 
 ### 5. Transmit one test message
@@ -325,27 +326,65 @@ terminator, and prepends the sending node's name plus `": "`. A node named
 The budget is read from the radio at startup rather than hardcoded, so
 renaming a node cannot silently start truncating messages.
 
-Segments are added in descending order of value and dropped from the bottom
-when they do not fit, so running out of room costs the least important
-information:
+The message is built from **facts extracted from the product**, not from the
+first 140 characters of its prose. NWS products follow a few templates, and
+each puts its decision-relevant content in a known place. Those pieces are
+pulled out, abbreviated, and added in order of value until the budget runs
+out:
 
 ```text
-Flood Watch: Greater Reno-Carson City-Minden Area, til Thu 21:00. Flash
-flooding caused by excessive rainfall continues to be possible.
-└── event ──┘  └────── area ──────┘  └── expiry ──┘  └──── detail ────┘
-   required      dropped 2nd          dropped 1st      truncated first
+Tornado Wrn: Lyon/Storey/Washoe til 14:15. TAKE COVER NOW! Tornado 7 mi E of Lockwood, moving E at 15 mph. Nr Derby Dam, 13:30.
+└─ event ─┘  └───── area ─────┘ └ window ┘ └ imperative ┘ └────────── storm location and motion ─────────┘ └─ next town ──┘
+  required     dropped first     kept        from instruction    from the "* At 1:25 PM, a ... was located" line   "will be near"
 ```
 
-Notes on the details:
+**Header.** Event, area, and window. The product name is abbreviated from a
+fixed vocabulary (`Severe Thunderstorm Warning` → `Svr Tstorm Wrn`,
+`Winter Storm Warning` → `Winter Strm Wrn`). Words that carry the hazard —
+Flood, Fire, Tornado, Heat, Wind, Freeze, Frost, Fog — are never shortened.
+`County` becomes `Co`, the state suffix is dropped, and up to three zones are
+named (`Lyon/Storey/Washoe`); longer lists collapse to `Santa Clarita Valley
++11`. If the header itself does not fit, the area goes first: the monitored
+point is fixed by configuration, so the area is largely implied, while "until
+when" never is.
 
-- Expiry is shown in the **alert area's local time**, which is what NWS
-  supplies and what a reader needs. The weekday appears only when the end is
-  not today.
-- Detail text prefers the alert's `instruction`, falling back to the `WHAT`
-  section of the description. The headline is never used: it restates the
-  event name and times already in the message.
-- A long list of counties collapses to `Washoe County +3`.
-- Text is folded to ASCII, and truncation never splits a UTF-8 character.
+**Window.** Start and end in the **alert area's local time**, as `HH:MM-HH:MM`.
+A date is attached only to a side whose day is not today, so a warning ending
+in an hour reads `til 14:15` while a watch for tomorrow reads
+`09/02 12:00-21:00`. Once an alert is in force its start is history and only
+the end is shown.
+
+**Body.** Which facts are extracted depends on the product's template:
+
+| Template | Recognised by | What is kept |
+|---|---|---|
+| Storm-based warning | `HAZARD...` line | Storm position and motion, the hazard, the next town, up to four places impacted |
+| Zone product | `* WHAT...` bullets | WHAT and IMPACTS; WHERE and WHEN are already in the header |
+| Fire weather | `* Winds...` bullets | Winds, RH, Impacts, with their key kept so numbers are not orphaned |
+| SPC watch | all-caps banner | Watch number and the cities listed |
+| Cancellation | "allowed to expire" | `Cancelled (weakened).` and nothing else |
+
+A short imperative from the instruction (`TAKE COVER NOW!`) goes ahead of the
+facts; a long instruction trails them. The headline is never used: it restates
+the event name and times already in the header.
+
+**Abbreviation.** Body text goes through a second, prose-safe vocabulary
+(`miles` → `mi`, `northeast` → `NE`, `35 to 45 mph` → `35-45 mph`,
+`National Weather Service` → `NWS`, `130 PM PDT` → `13:30`) and a set of
+rules that remove sentences carrying no decision-relevant content: "Blowing
+dust can be hazardous", "Remain aware of the weather", "The National Weather
+Service in Reno has issued a ...". An agency name followed by its own acronym
+collapses to the acronym. The vocabulary is in `wx_alert/abbrev.py` and is
+deliberately not configurable.
+
+**Truncation.** When a segment does not fit, it is cut at a sentence boundary
+if possible, then a clause, then a word, and only if at least 24 bytes remain;
+otherwise it is dropped. The message never ends mid-word. Text is folded to
+ASCII, and truncation never splits a UTF-8 character.
+
+The ntfy compact body is built from the same extracted facts, unabbreviated
+because a phone has room, headed by the area and window. The event is already
+the notification title.
 
 ---
 
@@ -978,7 +1017,8 @@ wx_alert/
   policy.py       startup staleness policy
   ratelimit.py    relevance filter and airtime rate limiter
   formatting.py   stdout and ntfy rendering
-  mesh_format.py  byte-budgeted rendering for LoRa
+  mesh_format.py  fact extraction and byte-budgeted rendering for LoRa
+  abbrev.py       abbreviation vocabulary and surplus-text rules
   radio.py        serial hard reset for a hung companion radio
   health.py       heartbeat and HEALTHCHECK entry point
   transports/     base protocol, ntfy, meshcore
