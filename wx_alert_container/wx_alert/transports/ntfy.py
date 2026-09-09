@@ -9,6 +9,7 @@ from urllib.parse import quote
 import requests
 
 from ..formatting import (
+    build_compact_ntfy_body,
     build_verbose_message,
     ntfy_priority_for_alert,
     ntfy_tags_for_alert,
@@ -143,13 +144,18 @@ class NtfyTransport:
             return DeliveryResult.SKIPPED, f"startup-stale: {reason}"
 
         event = clean_field(alert.get("event"), "Unknown weather alert")
-        headline = clean_field(alert.get("headline"), "No headline provided.")
         priority = ntfy_priority_for_alert(alert, self._priority)
         tags = ntfy_tags_for_alert(alert, self._tags)
 
         # The event is already the notification title, so the compact body
-        # only needs the headline. Verbose mode sends the full record.
-        message = build_verbose_message(alert) if self._verbose else headline
+        # carries the area, the window, and the extracted facts rather than
+        # the headline, which would restate the title. Verbose mode sends
+        # the full record.
+        message = (
+            build_verbose_message(alert)
+            if self._verbose
+            else build_compact_ntfy_body(alert, context.now)
+        )
 
         try:
             message_id = publish_ntfy_message(
